@@ -1,0 +1,19 @@
+# Spacefile Docs: https://huggingface.co/docs/hub/spaces-config-reference
+configuration:
+  hardware:
+    cpu: 1
+    memory: 1GB
+  docker:
+    enable: true
+
+build:
+  system_packages:
+    - build-essential
+    - curl
+    - libcurl4-openssl-dev
+    - libssl-dev
+
+services:
+  - name: fastapi
+    dist: Dockerfile
+    port: 7860 

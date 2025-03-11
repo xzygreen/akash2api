@@ -4,12 +4,14 @@ services:
   api:
     build: .
     ports:
-      - "9000:9000"
+      - "7860:7860"
     volumes:
       - .:/app
     environment:
       - ENVIRONMENT=development
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}  # 从宿主机环境变量获取，如果没有则为空
-    env_file:
-      - .env  # 从.env文件加载环境变量
-    restart: unless-stopped 
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7860"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
