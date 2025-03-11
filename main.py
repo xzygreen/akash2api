@@ -1,19 +1,14 @@
-from fastapi import FastAPI, Request, Response, Header, Depends, HTTPException
+from fastapi import FastAPI, Request, Depends, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import StreamingResponse
+from fastapi.background import BackgroundTasks
 import requests
 import uuid
 import json
 import time
-from typing import Optional, List, Dict, Any
-import cloudscraper
-from playwright.sync_api import sync_playwright
+from typing import Optional
 import asyncio
-from fastapi.background import BackgroundTasks
-import httpx
-from fake_useragent import UserAgent
 from curl_cffi import requests as cffi_requests
-import base64
 import re
 import os
 
@@ -21,7 +16,7 @@ app = FastAPI()
 security = HTTPBearer()
 
 # OpenAI API Key 配置，可以通过环境变量覆盖
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", None)  # 设置为 None 表示不校验，或设置具体值,如“sk-proj-1234567890”
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", None)  # 设置为 None 表示不校验，或设置具体值,如"sk-proj-1234567890"
 
 # 修改全局数据存储
 global_data = {

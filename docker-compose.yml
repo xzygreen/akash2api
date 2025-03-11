@@ -9,4 +9,7 @@ services:
       - .:/app
     environment:
       - ENVIRONMENT=development
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}  # 从宿主机环境变量获取，如果没有则为空
+    env_file:
+      - .env  # 从.env文件加载环境变量
     restart: unless-stopped 
