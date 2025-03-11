@@ -3,14 +3,16 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import StreamingResponse
 from fastapi.background import BackgroundTasks
 import requests
+from curl_cffi import requests as cffi_requests  # 保留这个，用于获取cookies
 import uuid
 import json
 import time
 from typing import Optional
 import asyncio
-from curl_cffi import requests as cffi_requests
-import re
+import base64
+import tempfile
 import os
+import re
 
 app = FastAPI()
 security = HTTPBearer()
@@ -73,44 +75,49 @@ async def get_api_key(credentials: HTTPAuthorizationCredentials = Depends(securi
     return token.replace("Bearer ", "") if token.startswith("Bearer ") else token
 
 async def check_image_status(session: requests.Session, job_id: str, headers: dict) -> Optional[str]:
-    """
-    检查图片生成状态并获取生成的图片
-    
-    Args:
-        session: 请求会话
-        job_id: 任务ID
-        headers: 请求头
-
-    Returns:
-        Optional[str]: base64格式的图片数据，如果生成失败则返回None
-    """
-    max_retries = 30  # 最多等待30秒
-    for _ in range(max_retries):
+    """检查图片生成状态并获取生成的图片"""
+    max_retries = 30
+    for attempt in range(max_retries):
         try:
+            print(f"\nAttempt {attempt + 1}/{max_retries} for job {job_id}")
             response = session.get(
                 f'https://chat.akash.network/api/image-status?ids={job_id}',
                 headers=headers
             )
+            print(f"Status response code: {response.status_code}")
             status_data = response.json()
             
             if status_data and isinstance(status_data, list) and len(status_data) > 0:
                 job_info = status_data[0]
+                status = job_info.get('status')
+                print(f"Job status: {status}")
                 
-                # 如果result不为空，说明图片已生成
-                if job_info.get("result"):
-                    return job_info["result"]  # 直接返回base64数据
-                
-                # 如果状态是失败，则停止等待
-                if job_info.get("status") == "failed":
-                    print(f"Image generation failed for job {job_id}")
+                # 只有当状态为 completed 时才处理结果
+                if status == "completed":
+                    result = job_info.get("result")
+                    if result and not result.startswith("Failed"):
+                        print("Got valid result, attempting upload...")
+                        image_url = await upload_to_xinyew(result, job_id)
+                        if image_url:
+                            print(f"Successfully uploaded image: {image_url}")
+                            return image_url
+                        print("Image upload failed")
+                        return None
+                    print("Invalid result received")
                     return None
+                elif status == "failed":
+                    print(f"Job {job_id} failed")
+                    return None
+                
+                # 如果状态是其他（如 pending），继续等待
+                await asyncio.sleep(1)
+                continue
                     
         except Exception as e:
-            print(f"Error checking image status: {e}")
-            
-        await asyncio.sleep(1)  # 等待1秒后重试
+            print(f"Error checking status: {e}")
+            return None
     
-    print(f"Timeout waiting for image generation job {job_id}")
+    print(f"Timeout waiting for job {job_id}")
     return None
 
 @app.get("/")
@@ -184,88 +191,34 @@ async def chat_completions(
                             # 在处理消息时先判断模型类型
                             if data.get('model') == 'AkashGen' and "<image_generation>" in msg_data:
                                 # 图片生成模型的特殊处理
-                                match = re.search(r"jobId='([^']+)' prompt='([^']+)' negative='([^']*)'", msg_data)
-                                if match:
-                                    job_id, prompt, negative = match.groups()
-                                    print(f"Starting image generation process for job_id: {job_id}")
-                                    
-                                    # 立即发送思考开始的消息
-                                    start_time = time.time()
-                                    think_msg = "<think>\n"
-                                    think_msg += "🎨 Generating image...\n\n"
-                                    think_msg += f"Prompt: {prompt}\n"
-                                    
-                                    # 发送思考开始消息 (使用标准 OpenAI 格式)
-                                    chunk = {
-                                        "id": f"chatcmpl-{chat_id}",
-                                        "object": "chat.completion.chunk",
-                                        "created": int(time.time()),
-                                        "model": data.get('model'),  # 使用请求中指定的模型
-                                        "choices": [{
-                                            "delta": {"content": think_msg},
-                                            "index": 0,
-                                            "finish_reason": None
-                                        }]
-                                    }
-                                    yield f"data: {json.dumps(chunk)}\n\n"
-                                    
-                                    # 同步方式检查图片状态
-                                    max_retries = 10
-                                    retry_interval = 3
-                                    result = None
-                                    
-                                    for attempt in range(max_retries):
-                                        try:
-                                            print(f"\nAttempt {attempt + 1}/{max_retries} for job {job_id}")
-                                            status_response = cffi_requests.get(
-                                                f'https://chat.akash.network/api/image-status?ids={job_id}',
-                                                headers=headers,
-                                                impersonate="chrome110"
-                                            )
-                                            print(f"Status response code: {status_response.status_code}")
-                                            status_data = status_response.json()
-                                            print(f"Status data: {json.dumps(status_data, indent=2)}")
-                                            
-                                            if status_data and isinstance(status_data, list) and len(status_data) > 0:
-                                                job_info = status_data[0]
-                                                print(f"Job status: {job_info.get('status')}")
-                                                
-                                                if job_info.get("result"):
-                                                    result = job_info['result']
-                                                    if result and not result.startswith("Failed"):
-                                                        break
-                                                elif job_info.get("status") == "failed":
-                                                    result = None
-                                                    break
-                                        except Exception as e:
-                                            print(f"Error checking status: {e}")
-                                            
-                                        if attempt < max_retries - 1:
-                                            time.sleep(retry_interval)
-                                    
-                                    # 发送结束消息
-                                    elapsed_time = time.time() - start_time
-                                    end_msg = f"\n🤔 Thinking for {elapsed_time:.1f}s...\n"
-                                    end_msg += "</think>\n\n"
-                                    if result and not result.startswith("Failed"):
-                                        end_msg += f"![Generated Image]({result})"
-                                    else:
-                                        end_msg += "*Image generation failed or timed out.*\n"
-                                    
-                                    # 发送结束消息 (使用标准 OpenAI 格式)
-                                    chunk = {
-                                        "id": f"chatcmpl-{chat_id}",
-                                        "object": "chat.completion.chunk",
-                                        "created": int(time.time()),
-                                        "model": data.get('model'),  # 使用请求中指定的模型
-                                        "choices": [{
-                                            "delta": {"content": end_msg},
-                                            "index": 0,
-                                            "finish_reason": None
-                                        }]
-                                    }
-                                    yield f"data: {json.dumps(chunk)}\n\n"
-                                    continue
+                                async def process_and_send():
+                                    end_msg = await process_image_generation(msg_data, session, headers, chat_id)
+                                    if end_msg:
+                                        chunk = {
+                                            "id": f"chatcmpl-{chat_id}",
+                                            "object": "chat.completion.chunk",
+                                            "created": int(time.time()),
+                                            "model": data.get('model'),
+                                            "choices": [{
+                                                "delta": {"content": end_msg},
+                                                "index": 0,
+                                                "finish_reason": None
+                                            }]
+                                        }
+                                        return f"data: {json.dumps(chunk)}\n\n"
+                                    return None
+
+                                # 创建新的事件循环
+                                loop = asyncio.new_event_loop()
+                                asyncio.set_event_loop(loop)
+                                try:
+                                    result = loop.run_until_complete(process_and_send())
+                                finally:
+                                    loop.close()
+                                
+                                if result:
+                                    yield result
+                                continue
                             
                             content_buffer += msg_data
                             
@@ -372,6 +325,102 @@ async def list_models(api_key: str = Depends(get_api_key)):
     except Exception as e:
         print(f"Error in list_models: {e}")
         return {"error": str(e)}
+
+async def upload_to_xinyew(image_base64: str, job_id: str) -> Optional[str]:
+    """上传图片到新野图床并返回URL"""
+    try:
+        print(f"\n=== Starting image upload for job {job_id} ===")
+        print(f"Base64 data length: {len(image_base64)}")
+        
+        # 解码base64图片数据
+        try:
+            image_data = base64.b64decode(image_base64.split(',')[1] if ',' in image_base64 else image_base64)
+            print(f"Decoded image data length: {len(image_data)} bytes")
+        except Exception as e:
+            print(f"Error decoding base64: {e}")
+            print(f"First 100 chars of base64: {image_base64[:100]}...")
+            return None
+        
+        # 创建临时文件
+        with tempfile.NamedTemporaryFile(suffix='.jpeg', delete=False) as temp_file:
+            temp_file.write(image_data)
+            temp_file_path = temp_file.name
+        
+        try:
+            filename = f"{job_id}.jpeg"
+            print(f"Using filename: {filename}")
+            
+            # 准备文件上传
+            files = {
+                'file': (filename, open(temp_file_path, 'rb'), 'image/jpeg')
+            }
+            
+            print("Sending request to xinyew.cn...")
+            response = requests.post(
+                'https://api.xinyew.cn/api/jdtc',
+                files=files,
+                timeout=30
+            )
+            
+            print(f"Upload response status: {response.status_code}")
+            if response.status_code == 200:
+                result = response.json()
+                print(f"Upload response: {result}")
+                
+                if result.get('errno') == 0:
+                    url = result.get('data', {}).get('url')
+                    if url:
+                        print(f"Successfully got image URL: {url}")
+                        return url
+                    print("No URL in response data")
+                else:
+                    print(f"Upload failed: {result.get('message')}")
+            else:
+                print(f"Upload failed with status {response.status_code}")
+                print(f"Response content: {response.text}")
+            return None
+                
+        finally:
+            # 清理临时文件
+            try:
+                os.unlink(temp_file_path)
+            except Exception as e:
+                print(f"Error removing temp file: {e}")
+            
+    except Exception as e:
+        print(f"Error in upload_to_xinyew: {e}")
+        import traceback
+        print(traceback.format_exc())
+        return None
+
+async def process_image_generation(msg_data: str, session: requests.Session, headers: dict, chat_id: str) -> str:
+    """处理图片生成的逻辑"""
+    match = re.search(r"jobId='([^']+)' prompt='([^']+)' negative='([^']*)'", msg_data)
+    if match:
+        job_id, prompt, negative = match.groups()
+        print(f"Starting image generation process for job_id: {job_id}")
+        
+        # 发送思考开始的消息
+        start_time = time.time()
+        end_msg = "<think>\n"
+        end_msg += "🎨 Generating image...\n\n"
+        end_msg += f"Prompt: {prompt}\n"
+        
+        # 检查图片状态和上传
+        result = await check_image_status(session, job_id, headers)
+        
+        # 发送结束消息
+        elapsed_time = time.time() - start_time
+        end_msg += f"\n🤔 Thinking for {elapsed_time:.1f}s...\n"
+        end_msg += "</think>\n\n"
+        
+        if result:  # result 现在是上传后的图片URL
+            end_msg += f"![Generated Image]({result})"
+        else:
+            end_msg += "*Image generation or upload failed.*\n"
+            
+        return end_msg
+    return ""
 
 if __name__ == '__main__':
     import uvicorn
