@@ -15,9 +15,13 @@ from fake_useragent import UserAgent
 from curl_cffi import requests as cffi_requests
 import base64
 import re
+import os
 
 app = FastAPI()
 security = HTTPBearer()
+
+# OpenAI API Key 配置，可以通过环境变量覆盖
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", None)  # 设置为 None 表示不校验，或设置具体值,如“sk-proj-1234567890”
 
 # 修改全局数据存储
 global_data = {
@@ -58,7 +62,20 @@ async def startup_event():
     get_cookie()
 
 async def get_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    return credentials.credentials
+    token = credentials.credentials
+    
+    # 如果设置了 OPENAI_API_KEY，则需要验证
+    if OPENAI_API_KEY is not None:
+        # 去掉 Bearer 前缀后再比较
+        clean_token = token.replace("Bearer ", "") if token.startswith("Bearer ") else token
+        if clean_token != OPENAI_API_KEY:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid API key"
+            )
+    
+    # 返回去掉 "Bearer " 前缀的token
+    return token.replace("Bearer ", "") if token.startswith("Bearer ") else token
 
 async def check_image_status(session: requests.Session, job_id: str, headers: dict) -> Optional[str]:
     """
@@ -100,6 +117,11 @@ async def check_image_status(session: requests.Session, job_id: str, headers: di
     
     print(f"Timeout waiting for image generation job {job_id}")
     return None
+
+@app.get("/")
+async def health_check():
+    """Health check endpoint"""
+    return {"status": "ok"}
 
 @app.post("/v1/chat/completions")
 async def chat_completions(
