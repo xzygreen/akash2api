@@ -293,17 +293,32 @@ async def list_models(api_key: str = Depends(get_api_key)):
         
         akash_response = response.json()
         
+        # 添加错误处理和调试信息
+        print(f"Akash API response: {akash_response}")
+        
+        # 检查响应格式并适配
+        models_list = []
+        if isinstance(akash_response, list):
+            # 如果直接是列表
+            models_list = akash_response
+        elif isinstance(akash_response, dict):
+            # 如果是字典格式
+            models_list = akash_response.get("models", [])
+        else:
+            print(f"Unexpected response format: {type(akash_response)}")
+            models_list = []
+        
         # 转换为标准 OpenAI 格式
         openai_models = {
             "object": "list",
             "data": [
                 {
-                    "id": model["id"],
+                    "id": model["id"] if isinstance(model, dict) else model,
                     "object": "model",
                     "created": int(time.time()),
                     "owned_by": "akash",
                     "permission": [{
-                        "id": "modelperm-" + model["id"],
+                        "id": f"modelperm-{model['id'] if isinstance(model, dict) else model}",
                         "object": "model_permission",
                         "created": int(time.time()),
                         "allow_create_engine": False,
@@ -316,7 +331,7 @@ async def list_models(api_key: str = Depends(get_api_key)):
                         "group": None,
                         "is_blocking": False
                     }]
-                } for model in akash_response.get("models", [])
+                } for model in models_list
             ]
         }
         
@@ -324,6 +339,8 @@ async def list_models(api_key: str = Depends(get_api_key)):
         
     except Exception as e:
         print(f"Error in list_models: {e}")
+        import traceback
+        print(traceback.format_exc())
         return {"error": str(e)}
 
 async def upload_to_xinyew(image_base64: str, job_id: str) -> Optional[str]:
