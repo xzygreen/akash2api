@@ -1,9 +1,10 @@
 from fastapi import FastAPI, Request, Depends, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, HTMLResponse
 from fastapi.background import BackgroundTasks
+from contextlib import asynccontextmanager
 import requests
-from curl_cffi import requests as cffi_requests  # 保留这个，用于获取cookies
+from curl_cffi import requests as cffi_requests
 import uuid
 import json
 import time
@@ -13,66 +14,141 @@ import base64
 import tempfile
 import os
 import re
+import threading
+from DrissionPage import ChromiumPage, ChromiumOptions
+import logging
+from dotenv import load_dotenv
 
-app = FastAPI()
-security = HTTPBearer()
+# 加载环境变量
+load_dotenv(override=True)
 
-# OpenAI API Key 配置，可以通过环境变量覆盖
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", None)  # 设置为 None 表示不校验，或设置具体值,如"sk-proj-1234567890"
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,  # 改为 INFO 级别
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # 修改全局数据存储
 global_data = {
     "cookie": None,
     "cookies": None,
-    "last_update": 0
+    "last_update": 0,
+    "cookie_expires": 0  # 添加 cookie 过期时间
 }
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 启动时获取 cookie
+    threading.Thread(target=get_cookie).start()
+    yield
+    # 关闭时清理资源
+    global_data["cookie"] = None
+    global_data["cookies"] = None
+    global_data["last_update"] = 0
+
+app = FastAPI(lifespan=lifespan)
+security = HTTPBearer()
+
+# OpenAI API Key 配置，可以通过环境变量覆盖
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", None)
+logger.info(f"OPENAI_API_KEY is set: {OPENAI_API_KEY is not None}")
+logger.info(f"OPENAI_API_KEY value: {OPENAI_API_KEY}")
 
 def get_cookie():
     try:
-        # 使用 curl_cffi 发送请求
-        response = cffi_requests.get(
-            'https://chat.akash.network/',
-            impersonate="chrome110",
-            timeout=30
-        )
+        options = ChromiumOptions().headless()
+        page = ChromiumPage(addr_or_opts=options)
+        page.set.window.size(1920, 1080)
+        page.set.user_agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         
-        # 获取所有 cookies
-        cookies = response.cookies.items()
-        if cookies:
-            cookie_str = '; '.join([f'{k}={v}' for k, v in cookies])
-            global_data["cookie"] = cookie_str
-            global_data["last_update"] = time.time()
-            print(f"Got cookies: {cookie_str}")
-            return cookie_str
+        page.get("https://chat.akash.network/")
+        time.sleep(10)
+        
+        cookies = page.cookies()
+        if not cookies:
+            page.quit()
+            return None
+            
+        cookie_dict = {cookie['name']: cookie['value'] for cookie in cookies}
+        if 'cf_clearance' not in cookie_dict:
+            page.quit()
+            return None
+            
+        cookie_str = '; '.join([f"{cookie['name']}={cookie['value']}" for cookie in cookies])
+        global_data["cookie"] = cookie_str
+        global_data["last_update"] = time.time()
+        
+        expires = min([cookie.get('expires', float('inf')) for cookie in cookies])
+        if expires != float('inf'):
+            global_data["cookie_expires"] = expires
+        else:
+            global_data["cookie_expires"] = time.time() + 3600
+        
+        page.quit()
+        return cookie_str
                 
     except Exception as e:
-        print(f"Error fetching cookie: {e}")
-    return None
+        logger.error(f"Error fetching cookie: {e}")
+        return None
+
+# 添加刷新 cookie 的函数
+async def refresh_cookie():
+    logger.info("Refreshing cookie due to 401 error")
+    # 标记 cookie 为过期
+    global_data["cookie_expires"] = 0
+    # 获取新的 cookie
+    return get_cookie()
 
 async def check_and_update_cookie(background_tasks: BackgroundTasks):
-    # 如果cookie超过30分钟，在后台更新
-    if time.time() - global_data["last_update"] > 1800:
+    # 如果 cookie 不存在或已过期，则更新
+    current_time = time.time()
+    if not global_data["cookie"] or current_time >= global_data["cookie_expires"]:
+        logger.info("Cookie expired or not available, refreshing...")
         background_tasks.add_task(get_cookie)
-
-@app.on_event("startup")
-async def startup_event():
-    get_cookie()
+    else:
+        logger.info("Using existing cookie")
 
 async def get_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
     token = credentials.credentials
+    logger.info(f"Received token: {token}")
     
     # 如果设置了 OPENAI_API_KEY，则需要验证
     if OPENAI_API_KEY is not None:
         # 去掉 Bearer 前缀后再比较
         clean_token = token.replace("Bearer ", "") if token.startswith("Bearer ") else token
+        logger.info(f"Clean token: {clean_token}")
         if clean_token != OPENAI_API_KEY:
+            logger.error(f"Token mismatch. Expected: {OPENAI_API_KEY}, Got: {clean_token}")
             raise HTTPException(
                 status_code=401,
                 detail="Invalid API key"
             )
+        logger.info("API key validation passed")
     
-    # 返回去掉 "Bearer " 前缀的token
-    return token.replace("Bearer ", "") if token.startswith("Bearer ") else token
+    return True
+
+async def validate_cookie(background_tasks: BackgroundTasks):
+    # 检查并更新 cookie（如果需要）
+    await check_and_update_cookie(background_tasks)
+    
+    # 等待 cookie 初始化完成
+    max_wait = 30  # 最大等待时间（秒）
+    start_time = time.time()
+    while not global_data["cookie"] and time.time() - start_time < max_wait:
+        await asyncio.sleep(1)
+        logger.info("Waiting for cookie initialization...")
+    
+    # 检查是否有有效的 cookie
+    if not global_data["cookie"]:
+        logger.error("Cookie not available after waiting")
+        raise HTTPException(
+            status_code=503,
+            detail="Service temporarily unavailable - Cookie not available"
+        )
+    
+    logger.info("Cookie validation passed")
+    return global_data["cookie"]
 
 async def check_image_status(session: requests.Session, job_id: str, headers: dict) -> Optional[str]:
     """检查图片生成状态并获取生成的图片"""
@@ -120,19 +196,118 @@ async def check_image_status(session: requests.Session, job_id: str, headers: di
     print(f"Timeout waiting for job {job_id}")
     return None
 
-@app.get("/")
+@app.get("/", response_class=HTMLResponse)
 async def health_check():
     """Health check endpoint"""
-    return {"status": "ok"}
+    status = {
+        "status": "ok",
+        "version": "1.0.0",
+        "cookie_status": {
+            "available": global_data["cookie"] is not None,
+            "last_update": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(global_data["last_update"])) if global_data["last_update"] > 0 else None,
+            "expires": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(global_data["cookie_expires"])) if global_data["cookie_expires"] > 0 else None
+        }
+    }
+    
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Akash API Status</title>
+        <style>
+            body {{
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+                line-height: 1.6;
+                margin: 0;
+                padding: 20px;
+                background-color: #f5f5f5;
+            }}
+            .container {{
+                max-width: 800px;
+                margin: 0 auto;
+                background-color: white;
+                padding: 20px;
+                border-radius: 8px;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            }}
+            h1 {{
+                color: #333;
+                margin-top: 0;
+            }}
+            .status {{
+                display: inline-block;
+                padding: 4px 8px;
+                border-radius: 4px;
+                font-weight: bold;
+                background-color: #4CAF50;
+                color: white;
+            }}
+            .info {{
+                margin-top: 20px;
+            }}
+            .info-item {{
+                margin-bottom: 10px;
+            }}
+            .label {{
+                font-weight: bold;
+                color: #666;
+            }}
+            .value {{
+                color: #333;
+            }}
+            .cookie-status {{
+                margin-top: 20px;
+                padding: 15px;
+                background-color: #f8f9fa;
+                border-radius: 4px;
+            }}
+            .cookie-status .available {{
+                color: {"#4CAF50" if status["cookie_status"]["available"] else "#f44336"};
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>Akash API Status <span class="status">{status["status"]}</span></h1>
+            
+            <div class="info">
+                <div class="info-item">
+                    <span class="label">Version:</span>
+                    <span class="value">{status["version"]}</span>
+                </div>
+            </div>
+            
+            <div class="cookie-status">
+                <h2>Cookie Status</h2>
+                <div class="info-item">
+                    <span class="label">Available:</span>
+                    <span class="value available">{str(status["cookie_status"]["available"])}</span>
+                </div>
+                <div class="info-item">
+                    <span class="label">Last Update:</span>
+                    <span class="value">{status["cookie_status"]["last_update"] or "Never"}</span>
+                </div>
+                <div class="info-item">
+                    <span class="label">Expires:</span>
+                    <span class="value">{status["cookie_status"]["expires"] or "Unknown"}</span>
+                </div>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    
+    return html
 
 @app.post("/v1/chat/completions")
 async def chat_completions(
     request: Request,
-    api_key: str = Depends(get_api_key)
+    background_tasks: BackgroundTasks,
+    api_key: bool = Depends(get_api_key),
+    cookie: str = Depends(validate_cookie)
 ):
     try:
         data = await request.json()
-        print(f"Chat request data: {data}")
         
         chat_id = str(uuid.uuid4()).replace('-', '')[:16]
         
@@ -145,24 +320,23 @@ async def chat_completions(
             "topP": data.get('top_p', 0.95)
         }
         
+        # 构建请求头
         headers = {
             "Content-Type": "application/json",
-            "Cookie": f"session_token={api_key}",
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept": "*/*",
-            "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Accept-Language": "en-US,en;q=0.9",
             "Accept-Encoding": "gzip, deflate, br",
             "Origin": "https://chat.akash.network",
             "Referer": "https://chat.akash.network/",
             "Sec-Fetch-Dest": "empty",
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Site": "same-origin",
-            "Connection": "keep-alive",
-            "Priority": "u=1, i"
+            "Connection": "keep-alive"
         }
         
-        print(f"Sending request to Akash with headers: {headers}")
-        print(f"Request data: {akash_data}")
+        # 设置 Cookie
+        headers["Cookie"] = cookie
         
         with requests.Session() as session:
             response = session.post(
@@ -170,6 +344,26 @@ async def chat_completions(
                 json=akash_data,
                 headers=headers,
                 stream=True
+            )
+            
+            # 检查响应状态码，如果是 401，尝试刷新 cookie 并重试
+            if response.status_code == 401:
+                logger.info("Cookie expired, refreshing...")
+                new_cookie = await refresh_cookie()
+                if new_cookie:
+                    headers["Cookie"] = new_cookie
+                    response = session.post(
+                        'https://chat.akash.network/api/chat',
+                        json=akash_data,
+                        headers=headers,
+                        stream=True
+                    )
+            
+            if response.status_code != 200:
+                logger.error(f"Akash API error: {response.text}")
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail=f"Akash API error: {response.text}"
             )
             
             def generate():
@@ -208,7 +402,7 @@ async def chat_completions(
                                 if result_messages:
                                     for message in result_messages:
                                         yield f"data: {json.dumps(message)}\n\n"
-                                continue
+                                    continue
                             
                             content_buffer += msg_data
                             
@@ -230,7 +424,7 @@ async def chat_completions(
                                 "id": f"chatcmpl-{chat_id}",
                                 "object": "chat.completion.chunk",
                                 "created": int(time.time()),
-                                "model": data.get('model'),  # 使用请求中指定的模型
+                                "model": data.get('model'),
                                 "choices": [{
                                     "delta": {},
                                     "index": 0,
@@ -256,30 +450,47 @@ async def chat_completions(
             )
     
     except Exception as e:
+        print(f"Error in chat_completions: {e}")
+        import traceback
+        print(traceback.format_exc())
         return {"error": str(e)}
 
 @app.get("/v1/models")
-async def list_models(api_key: str = Depends(get_api_key)):
+async def list_models(
+    background_tasks: BackgroundTasks,
+    cookie: str = Depends(validate_cookie)
+):
     try:
         headers = {
-            "Content-Type": "application/json",
-            "Cookie": f"session_token={api_key}",
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
-            "Accept": "*/*",
-            "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Origin": "https://chat.akash.network",
-            "Referer": "https://chat.akash.network/",
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-origin",
-            "Connection": "keep-alive"
+            "accept": "application/json",
+            "accept-language": "en-US,en;q=0.9",
+            "sec-ch-ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"macOS"',
+            "sec-fetch-dest": "document",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
+            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "referer": "https://chat.akash.network/"
         }
+        
+        # 设置 Cookie
+        headers["Cookie"] = cookie
+        
+        print(f"Using cookie: {headers.get('Cookie', 'None')}")
+        print("Sending request to get models...")
         
         response = requests.get(
             'https://chat.akash.network/api/models',
             headers=headers
         )
+        
+        print(f"Models response status: {response.status_code}")
+        print(f"Models response headers: {response.headers}")
+        
+        if response.status_code == 401:
+            print("Authentication failed. Please check your API key.")
+            return {"error": "Authentication failed. Please check your API key."}
         
         akash_response = response.json()
         
@@ -332,73 +543,6 @@ async def list_models(api_key: str = Depends(get_api_key)):
         import traceback
         print(traceback.format_exc())
         return {"error": str(e)}
-
-async def upload_to_xinyew(image_base64: str, job_id: str) -> Optional[str]:
-    """上传图片到新野图床并返回URL"""
-    try:
-        print(f"\n=== Starting image upload for job {job_id} ===")
-        print(f"Base64 data length: {len(image_base64)}")
-        
-        # 解码base64图片数据
-        try:
-            image_data = base64.b64decode(image_base64.split(',')[1] if ',' in image_base64 else image_base64)
-            print(f"Decoded image data length: {len(image_data)} bytes")
-        except Exception as e:
-            print(f"Error decoding base64: {e}")
-            print(f"First 100 chars of base64: {image_base64[:100]}...")
-            return None
-        
-        # 创建临时文件
-        with tempfile.NamedTemporaryFile(suffix='.jpeg', delete=False) as temp_file:
-            temp_file.write(image_data)
-            temp_file_path = temp_file.name
-        
-        try:
-            filename = f"{job_id}.jpeg"
-            print(f"Using filename: {filename}")
-            
-            # 准备文件上传
-            files = {
-                'file': (filename, open(temp_file_path, 'rb'), 'image/jpeg')
-            }
-            
-            print("Sending request to xinyew.cn...")
-            response = requests.post(
-                'https://api.xinyew.cn/api/jdtc',
-                files=files,
-                timeout=30
-            )
-            
-            print(f"Upload response status: {response.status_code}")
-            if response.status_code == 200:
-                result = response.json()
-                print(f"Upload response: {result}")
-                
-                if result.get('errno') == 0:
-                    url = result.get('data', {}).get('url')
-                    if url:
-                        print(f"Successfully got image URL: {url}")
-                        return url
-                    print("No URL in response data")
-                else:
-                    print(f"Upload failed: {result.get('message')}")
-            else:
-                print(f"Upload failed with status {response.status_code}")
-                print(f"Response content: {response.text}")
-            return None
-                
-        finally:
-            # 清理临时文件
-            try:
-                os.unlink(temp_file_path)
-            except Exception as e:
-                print(f"Error removing temp file: {e}")
-            
-    except Exception as e:
-        print(f"Error in upload_to_xinyew: {e}")
-        import traceback
-        print(traceback.format_exc())
-        return None
 
 async def process_image_generation(msg_data: str, session: requests.Session, headers: dict, chat_id: str) -> Optional[list]:
     """处理图片生成的逻辑，返回多个消息块"""
@@ -471,6 +615,73 @@ async def process_image_generation(msg_data: str, session: requests.Session, hea
         
         return messages
     return None
+
+async def upload_to_xinyew(image_base64: str, job_id: str) -> Optional[str]:
+    """上传图片到新野图床并返回URL"""
+    try:
+        print(f"\n=== Starting image upload for job {job_id} ===")
+        print(f"Base64 data length: {len(image_base64)}")
+        
+        # 解码base64图片数据
+        try:
+            image_data = base64.b64decode(image_base64.split(',')[1] if ',' in image_base64 else image_base64)
+            print(f"Decoded image data length: {len(image_data)} bytes")
+        except Exception as e:
+            print(f"Error decoding base64: {e}")
+            print(f"First 100 chars of base64: {image_base64[:100]}...")
+            return None
+        
+        # 创建临时文件
+        with tempfile.NamedTemporaryFile(suffix='.jpeg', delete=False) as temp_file:
+            temp_file.write(image_data)
+            temp_file_path = temp_file.name
+        
+        try:
+            filename = f"{job_id}.jpeg"
+            print(f"Using filename: {filename}")
+            
+            # 准备文件上传
+            files = {
+                'file': (filename, open(temp_file_path, 'rb'), 'image/jpeg')
+            }
+            
+            print("Sending request to xinyew.cn...")
+            response = requests.post(
+                'https://api.xinyew.cn/api/jdtc',
+                files=files,
+                timeout=30
+            )
+            
+            print(f"Upload response status: {response.status_code}")
+            if response.status_code == 200:
+                result = response.json()
+                print(f"Upload response: {result}")
+                
+                if result.get('errno') == 0:
+                    url = result.get('data', {}).get('url')
+                    if url:
+                        print(f"Successfully got image URL: {url}")
+                        return url
+                    print("No URL in response data")
+                else:
+                    print(f"Upload failed: {result.get('message')}")
+            else:
+                print(f"Upload failed with status {response.status_code}")
+                print(f"Response content: {response.text}")
+            return None
+                
+        finally:
+            # 清理临时文件
+            try:
+                os.unlink(temp_file_path)
+            except Exception as e:
+                print(f"Error removing temp file: {e}")
+            
+    except Exception as e:
+        print(f"Error in upload_to_xinyew: {e}")
+        import traceback
+        print(traceback.format_exc())
+        return None
 
 if __name__ == '__main__':
     import uvicorn
