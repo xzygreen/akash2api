@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Request, Depends, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.responses import StreamingResponse, HTMLResponse
+from fastapi.responses import StreamingResponse, HTMLResponse, RedirectResponse
 from fastapi.background import BackgroundTasks
 from contextlib import asynccontextmanager
 import requests
@@ -18,6 +18,7 @@ import threading
 import logging
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
+from datetime import datetime, timezone, timedelta
 
 # 加载环境变量
 load_dotenv(override=True)
@@ -83,10 +84,12 @@ logger.info(f"OPENAI_API_KEY is set: {OPENAI_API_KEY is not None}")
 logger.info(f"OPENAI_API_KEY value: {OPENAI_API_KEY}")
 
 def get_cookie():
+    """获取 cookie 的函数"""
     try:
         logger.info("Starting cookie retrieval process...")
         
         with sync_playwright() as p:
+            browser = None
             try:
                 # 启动浏览器
                 logger.info("Launching browser...")
@@ -176,14 +179,16 @@ def get_cookie():
                 
                 if not cookies:
                     logger.error("No cookies found")
-                    browser.close()
+                    if browser:
+                        browser.close()
                     return None
                     
                 # 检查是否有 cf_clearance cookie
                 cf_cookie = next((cookie for cookie in cookies if cookie['name'] == 'cf_clearance'), None)
                 if not cf_cookie:
                     logger.error("cf_clearance cookie not found")
-                    browser.close()
+                    if browser:
+                        browser.close()
                     return None
                     
                 # 构建 cookie 字符串
@@ -203,7 +208,8 @@ def get_cookie():
                     logger.info("No explicit expiration in session_token cookie, setting default 1 hour expiration")
                 
                 logger.info("Successfully retrieved cookies")
-                browser.close()
+                if browser:
+                    browser.close()
                 return cookie_str
                 
             except Exception as e:
@@ -211,6 +217,8 @@ def get_cookie():
                 logger.error(f"Error type: {type(e)}")
                 import traceback
                 logger.error(f"Traceback: {traceback.format_exc()}")
+                if browser:
+                    browser.close()
                 return None
                 
     except Exception as e:
@@ -324,124 +332,331 @@ async def check_image_status(session: requests.Session, job_id: str, headers: di
     print(f"Timeout waiting for job {job_id}")
     return None
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/")
 async def health_check():
-    """Health check endpoint"""
+    """健康检查端点，返回服务状态"""
     # 检查 cookie 状态
-    cookie_status = "ok" if global_data["cookie"] is not None else "error"
-    cookie_status_color = "#4CAF50" if cookie_status == "ok" else "#f44336"
+    cookie_status = "ok" if global_data["cookie"] else "error"
+    status_color = "green" if cookie_status == "ok" else "red"
+    status_text = "正常" if cookie_status == "ok" else "异常"
+    
+    # 获取当前时间（北京时间）
+    current_time = datetime.now(timezone(timedelta(hours=8)))
+    
+    # 格式化 cookie 过期时间（北京时间）
+    if global_data["cookie_expires"]:
+        expires_time = datetime.fromtimestamp(global_data["cookie_expires"], timezone(timedelta(hours=8)))
+        expires_str = expires_time.strftime("%Y-%m-%d %H:%M:%S")
+        
+        # 计算剩余时间
+        time_left = global_data["cookie_expires"] - time.time()
+        hours_left = int(time_left // 3600)
+        minutes_left = int((time_left % 3600) // 60)
+        
+        if hours_left > 0:
+            time_left_str = f"{hours_left}小时{minutes_left}分钟"
+        else:
+            time_left_str = f"{minutes_left}分钟"
+    else:
+        expires_str = "未知"
+        time_left_str = "未知"
+    
+    # 格式化最后更新时间（北京时间）
+    if global_data["last_update"]:
+        last_update_time = datetime.fromtimestamp(global_data["last_update"], timezone(timedelta(hours=8)))
+        last_update_str = last_update_time.strftime("%Y-%m-%d %H:%M:%S")
+        
+        # 计算多久前更新
+        time_since_update = time.time() - global_data["last_update"]
+        if time_since_update < 60:
+            update_ago = f"{int(time_since_update)}秒前"
+        elif time_since_update < 3600:
+            update_ago = f"{int(time_since_update // 60)}分钟前"
+        else:
+            update_ago = f"{int(time_since_update // 3600)}小时前"
+    else:
+        last_update_str = "从未更新"
+        update_ago = "未知"
     
     status = {
-        "status": cookie_status,
-        "version": "1.0.0",
+        "status": "ok",
         "cookie_status": {
-            "available": global_data["cookie"] is not None,
-            "last_update": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(global_data["last_update"])) if global_data["last_update"] > 0 else None,
-            "expires": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(global_data["cookie_expires"])) if global_data["cookie_expires"] > 0 else None
+            "status": cookie_status,
+            "status_text": status_text,
+            "status_color": status_color,
+            "expires": expires_str,
+            "time_left": time_left_str,
+            "available": bool(global_data["cookie"]),
+            "last_update": last_update_str,
+            "update_ago": update_ago
         }
     }
     
-    html = f"""
+    # 返回 HTML 响应
+    return HTMLResponse(content=f"""
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Akash API Status</title>
+        <title>Akash API 服务状态</title>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <style>
             body {{
-                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-                line-height: 1.6;
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
                 margin: 0;
                 padding: 20px;
                 background-color: #f5f5f5;
+                color: #333;
+                line-height: 1.6;
             }}
             .container {{
                 max-width: 800px;
                 margin: 0 auto;
                 background-color: white;
-                padding: 20px;
-                border-radius: 8px;
-                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                padding: 30px;
+                border-radius: 12px;
+                box-shadow: 0 4px 12px rgba(0,0,0,0.1);
             }}
-            h1 {{
-                color: #333;
-                margin-top: 0;
+            .header {{
+                display: flex;
+                align-items: center;
+                margin-bottom: 30px;
+                border-bottom: 1px solid #eee;
+                padding-bottom: 20px;
+            }}
+            .logo {{
+                font-size: 24px;
+                font-weight: bold;
+                color: #2c3e50;
+                margin-right: 15px;
+                display: flex;
+                align-items: center;
+            }}
+            .logo-icon {{
+                margin-right: 10px;
+                font-size: 28px;
             }}
             .status {{
+                display: flex;
+                align-items: center;
+                margin-bottom: 30px;
+            }}
+            .status-dot {{
+                width: 16px;
+                height: 16px;
+                border-radius: 50%;
+                margin-right: 12px;
+                box-shadow: 0 0 0 4px rgba(76, 175, 80, 0.2);
+            }}
+            .status-dot.green {{
+                background-color: #4CAF50;
+                box-shadow: 0 0 0 4px rgba(76, 175, 80, 0.2);
+            }}
+            .status-dot.red {{
+                background-color: #f44336;
+                box-shadow: 0 0 0 4px rgba(244, 67, 54, 0.2);
+            }}
+            .status-text {{
+                font-size: 20px;
+                font-weight: 600;
+            }}
+            .status-text.ok {{
+                color: #4CAF50;
+            }}
+            .status-text.error {{
+                color: #f44336;
+            }}
+            .info-section {{
+                background-color: #f9f9f9;
+                border-radius: 8px;
+                padding: 20px;
+                margin-top: 20px;
+            }}
+            .info-section h3 {{
+                margin-top: 0;
+                color: #2c3e50;
+                font-size: 18px;
+                border-bottom: 1px solid #eee;
+                padding-bottom: 10px;
+                display: flex;
+                align-items: center;
+            }}
+            .info-section h3 i {{
+                margin-right: 8px;
+            }}
+            .info-item {{
+                margin: 15px 0;
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+            }}
+            .label {{
+                color: #666;
+                font-weight: 500;
+                display: flex;
+                align-items: center;
+            }}
+            .label i {{
+                margin-right: 8px;
+                font-size: 16px;
+            }}
+            .value {{
+                font-weight: 600;
+                padding: 5px 10px;
+                border-radius: 4px;
+                background-color: #f0f0f0;
+                display: flex;
+                align-items: center;
+                gap: 5px;
+            }}
+            .value .status-text {{
+                font-weight: 600;
+            }}
+            .value .status-text.ok {{
+                color: #4CAF50;
+            }}
+            .value .status-text.error {{
+                color: #f44336;
+            }}
+            .value.available {{
+                color: #4CAF50;
+                background-color: rgba(76, 175, 80, 0.1);
+            }}
+            .value.unavailable {{
+                color: #f44336;
+                background-color: rgba(244, 67, 54, 0.1);
+            }}
+            .value i {{
+                font-size: 16px;
+            }}
+            .footer {{
+                margin-top: 30px;
+                text-align: center;
+                color: #999;
+                font-size: 14px;
+                border-top: 1px solid #eee;
+                padding-top: 20px;
+            }}
+            .refresh-btn {{
+                display: inline-block;
+                background-color: #3498db;
+                color: white;
+                padding: 8px 16px;
+                border-radius: 4px;
+                text-decoration: none;
+                margin-top: 20px;
+                font-weight: 500;
+                transition: background-color 0.3s;
+            }}
+            .refresh-btn:hover {{
+                background-color: #2980b9;
+            }}
+            .action-buttons {{
+                display: flex;
+                justify-content: center;
+                gap: 15px;
+                margin-top: 20px;
+            }}
+            .action-btn {{
+                display: inline-flex;
+                align-items: center;
+                background-color: #f8f9fa;
+                color: #333;
+                padding: 8px 16px;
+                border-radius: 4px;
+                text-decoration: none;
+                font-weight: 500;
+                transition: all 0.3s;
+                border: 1px solid #ddd;
+            }}
+            .action-btn:hover {{
+                background-color: #e9ecef;
+                border-color: #ced4da;
+            }}
+            .action-btn i {{
+                margin-right: 8px;
+            }}
+            .status-badge {{
                 display: inline-block;
                 padding: 4px 8px;
                 border-radius: 4px;
-                font-weight: bold;
-                background-color: {cookie_status_color};
-                color: white;
+                font-size: 14px;
+                font-weight: 500;
+                margin-left: 10px;
             }}
-            .info {{
-                margin-top: 20px;
+            .status-badge.ok {{
+                background-color: rgba(76, 175, 80, 0.1);
+                color: #4CAF50;
             }}
-            .info-item {{
-                margin-bottom: 10px;
-            }}
-            .label {{
-                font-weight: bold;
-                color: #666;
-            }}
-            .value {{
-                color: #333;
-            }}
-            .cookie-status {{
-                margin-top: 20px;
-                padding: 15px;
-                background-color: #f8f9fa;
-                border-radius: 4px;
-            }}
-            .cookie-status .available {{
-                color: {cookie_status_color};
-            }}
-            .error-message {{
+            .status-badge.error {{
+                background-color: rgba(244, 67, 54, 0.1);
                 color: #f44336;
-                margin-top: 10px;
-                padding: 10px;
-                background-color: #ffebee;
-                border-radius: 4px;
-                display: {"block" if cookie_status == "error" else "none"};
+            }}
+            .time-info {{
+                font-size: 14px;
+                color: #666;
+                margin-top: 5px;
+            }}
+            .api-info {{
+                margin-top: 30px;
+                background-color: #f0f7ff;
+                border-radius: 8px;
+                padding: 20px;
+                border-left: 4px solid #3498db;
+            }}
+            .api-info h3 {{
+                margin-top: 0;
+                color: #2c3e50;
+                font-size: 18px;
+            }}
+            .api-info p {{
+                margin: 10px 0;
+            }}
+            .api-info code {{
+                background-color: #e9ecef;
+                padding: 2px 5px;
+                border-radius: 3px;
+                font-family: monospace;
             }}
         </style>
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
     </head>
     <body>
         <div class="container">
-            <h1>Akash API Status <span class="status">{status["status"]}</span></h1>
-            
-            <div class="info">
-                <div class="info-item">
-                    <span class="label">Version:</span>
-                    <span class="value">{status["version"]}</span>
+            <div class="header">
+                <div class="logo">
+                    <i class="fas fa-robot"></i>
+                    <span>Akash API</span>
                 </div>
             </div>
+            <div class="status">
+                <div class="status-dot {status["cookie_status"]["status_color"]}"></div>
+                <div class="status-text {status["cookie_status"]["status"]}">服务状态: {status["cookie_status"]["status_text"]}</div>
+            </div>
+            <div class="info-section">
             
-            <div class="cookie-status">
-                <h2>Cookie Status</h2>
+                <h3><i class="fas fa-cookie"></i> Cookie 信息</h3>
                 <div class="info-item">
-                    <span class="label">Available:</span>
-                    <span class="value available">{str(status["cookie_status"]["available"])}</span>
+                    <span class="label"><i class="fas fa-clock"></i> 过期时间:</span>
+                    <span class="value">{status["cookie_status"]["expires"]}</span>
                 </div>
+                <div class="time-info">剩余时间: {status["cookie_status"]["time_left"]}</div>            
                 <div class="info-item">
-                    <span class="label">Last Update:</span>
-                    <span class="value">{status["cookie_status"]["last_update"] or "Never"}</span>
+                    <span class="label"><i class="fas fa-history"></i> 最后更新:</span>
+                    <span class="value">{status["cookie_status"]["last_update"]}</span>
                 </div>
-                <div class="info-item">
-                    <span class="label">Expires:</span>
-                    <span class="value">{status["cookie_status"]["expires"] or "Unknown"}</span>
-                </div>
-                
-                <div class="error-message">
-                    Cookie retrieval failed. The service may not be fully functional.
-                </div>
+                <div class="time-info">更新时间: {status["cookie_status"]["update_ago"]}</div>
+            </div>
+            
+            
+            <div class="footer">
+                <p>Akash API 服务 - 健康检查页面</p>
+                <p>当前时间: {current_time.strftime("%Y-%m-%d %H:%M:%S")} (北京时间)</p>
             </div>
         </div>
     </body>
     </html>
-    """
-    
-    return html
+    """)
 
 @app.post("/v1/chat/completions")
 async def chat_completions(
