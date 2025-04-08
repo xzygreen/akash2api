@@ -15,9 +15,9 @@ import tempfile
 import os
 import re
 import threading
-from DrissionPage import ChromiumPage, ChromiumOptions
 import logging
 from dotenv import load_dotenv
+from playwright.sync_api import sync_playwright
 
 # 加载环境变量
 load_dotenv(override=True)
@@ -40,12 +40,39 @@ global_data = {
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 启动时获取 cookie
-    threading.Thread(target=get_cookie).start()
+    logger.info("Starting FastAPI application, initializing cookie fetcher...")
+    
+    # 创建并启动线程
+    cookie_thread = threading.Thread(target=get_cookie_with_retry)
+    cookie_thread.daemon = True  # 设置为守护线程
+    cookie_thread.start()
+    
+    logger.info("Cookie fetcher thread started")
     yield
+    
     # 关闭时清理资源
+    logger.info("Shutting down FastAPI application")
     global_data["cookie"] = None
     global_data["cookies"] = None
     global_data["last_update"] = 0
+
+def get_cookie_with_retry(max_retries=3, retry_delay=5):
+    """带重试机制的获取 cookie 函数"""
+    retries = 0
+    while retries < max_retries:
+        logger.info(f"Cookie fetching attempt {retries + 1}/{max_retries}")
+        cookie = get_cookie()
+        if cookie:
+            logger.info("Successfully retrieved cookie")
+            return cookie
+        
+        retries += 1
+        if retries < max_retries:
+            logger.info(f"Retrying cookie fetch in {retry_delay} seconds...")
+            time.sleep(retry_delay)
+    
+    logger.error(f"Failed to fetch cookie after {max_retries} attempts")
+    return None
 
 app = FastAPI(lifespan=lifespan)
 security = HTTPBearer()
@@ -57,39 +84,140 @@ logger.info(f"OPENAI_API_KEY value: {OPENAI_API_KEY}")
 
 def get_cookie():
     try:
-        options = ChromiumOptions().headless()
-        page = ChromiumPage(addr_or_opts=options)
-        page.set.window.size(1920, 1080)
-        page.set.user_agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        logger.info("Starting cookie retrieval process...")
         
-        page.get("https://chat.akash.network/")
-        time.sleep(10)
-        
-        cookies = page.cookies()
-        if not cookies:
-            page.quit()
-            return None
-            
-        cookie_dict = {cookie['name']: cookie['value'] for cookie in cookies}
-        if 'cf_clearance' not in cookie_dict:
-            page.quit()
-            return None
-            
-        cookie_str = '; '.join([f"{cookie['name']}={cookie['value']}" for cookie in cookies])
-        global_data["cookie"] = cookie_str
-        global_data["last_update"] = time.time()
-        
-        expires = min([cookie.get('expires', float('inf')) for cookie in cookies])
-        if expires != float('inf'):
-            global_data["cookie_expires"] = expires
-        else:
-            global_data["cookie_expires"] = time.time() + 3600
-        
-        page.quit()
-        return cookie_str
+        with sync_playwright() as p:
+            try:
+                # 启动浏览器
+                logger.info("Launching browser...")
+                browser = p.chromium.launch(
+                    headless=True,
+                    args=[
+                        '--no-sandbox',
+                        '--disable-dev-shm-usage',
+                        '--disable-gpu',
+                        '--disable-software-rasterizer',
+                        '--disable-extensions',
+                        '--disable-setuid-sandbox',
+                        '--no-first-run',
+                        '--no-zygote',
+                        '--single-process',
+                        '--window-size=1920,1080',
+                        '--disable-blink-features=AutomationControlled'  # 禁用自动化控制检测
+                    ]
+                )
+                
+                logger.info("Browser launched successfully")
+                
+                # 创建上下文，添加更多浏览器特征
+                logger.info("Creating browser context...")
+                context = browser.new_context(
+                    viewport={'width': 1920, 'height': 1080},
+                    user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    locale='en-US',
+                    timezone_id='America/New_York',
+                    permissions=['geolocation'],
+                    extra_http_headers={
+                        'Accept-Language': 'en-US,en;q=0.9',
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+                        'Sec-Ch-Ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+                        'Sec-Ch-Ua-Mobile': '?0',
+                        'Sec-Ch-Ua-Platform': '"macOS"',
+                        'Sec-Fetch-Dest': 'document',
+                        'Sec-Fetch-Mode': 'navigate',
+                        'Sec-Fetch-Site': 'none',
+                        'Sec-Fetch-User': '?1',
+                        'Upgrade-Insecure-Requests': '1'
+                    }
+                )
+                
+                logger.info("Browser context created successfully")
+                
+                # 创建页面
+                logger.info("Creating new page...")
+                page = context.new_page()
+                logger.info("Page created successfully")
+                
+                # 设置页面超时
+                page.set_default_timeout(60000)
+                
+                # 访问目标网站
+                logger.info("Navigating to target website...")
+                page.goto("https://chat.akash.network/", timeout=50000)
+                
+                # 等待页面加载
+                logger.info("Waiting for page load...")
+                try:
+                    # 首先等待 DOM 加载完成
+                    page.wait_for_load_state("domcontentloaded", timeout=30000)
+                    logger.info("DOM content loaded")
+                    
+                    # 等待一段时间，让 Cloudflare 检查完成
+                    logger.info("Waiting for Cloudflare check...")
+                    time.sleep(5)
+                    
+                    # 尝试点击页面，模拟用户行为
+                    try:
+                        page.mouse.move(100, 100)
+                        page.mouse.click(100, 100)
+                        logger.info("Simulated user interaction")
+                    except Exception as e:
+                        logger.warning(f"Failed to simulate user interaction: {e}")
+                    
+                    # 再次等待一段时间
+                    time.sleep(5)
+                    
+                except Exception as e:
+                    logger.warning(f"Timeout waiting for load state: {e}")
+                
+                # 获取 cookies
+                logger.info("Getting cookies...")
+                cookies = context.cookies()
+                
+                if not cookies:
+                    logger.error("No cookies found")
+                    browser.close()
+                    return None
+                    
+                # 检查是否有 cf_clearance cookie
+                cf_cookie = next((cookie for cookie in cookies if cookie['name'] == 'cf_clearance'), None)
+                if not cf_cookie:
+                    logger.error("cf_clearance cookie not found")
+                    browser.close()
+                    return None
+                    
+                # 构建 cookie 字符串
+                cookie_str = '; '.join([f"{cookie['name']}={cookie['value']}" for cookie in cookies])
+                global_data["cookie"] = cookie_str
+                global_data["cookies"] = cookies  # 保存完整的 cookies 列表
+                global_data["last_update"] = time.time()
+                
+                # 查找 session_token cookie 的过期时间
+                session_cookie = next((cookie for cookie in cookies if cookie['name'] == 'session_token'), None)
+                if session_cookie and 'expires' in session_cookie and session_cookie['expires'] > 0:
+                    global_data["cookie_expires"] = session_cookie['expires']
+                    logger.info(f"Session token expires at: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(session_cookie['expires']))}")
+                else:
+                    # 如果没有明确的过期时间，默认设置为1小时后过期
+                    global_data["cookie_expires"] = time.time() + 3600
+                    logger.info("No explicit expiration in session_token cookie, setting default 1 hour expiration")
+                
+                logger.info("Successfully retrieved cookies")
+                browser.close()
+                return cookie_str
+                
+            except Exception as e:
+                logger.error(f"Error in browser operations: {e}")
+                logger.error(f"Error type: {type(e)}")
+                import traceback
+                logger.error(f"Traceback: {traceback.format_exc()}")
+                return None
                 
     except Exception as e:
-        logger.error(f"Error fetching cookie: {e}")
+        logger.error(f"Error fetching cookie: {str(e)}")
+        logger.error(f"Error type: {type(e)}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
         return None
 
 # 添加刷新 cookie 的函数
@@ -199,8 +327,12 @@ async def check_image_status(session: requests.Session, job_id: str, headers: di
 @app.get("/", response_class=HTMLResponse)
 async def health_check():
     """Health check endpoint"""
+    # 检查 cookie 状态
+    cookie_status = "ok" if global_data["cookie"] is not None else "error"
+    cookie_status_color = "#4CAF50" if cookie_status == "ok" else "#f44336"
+    
     status = {
-        "status": "ok",
+        "status": cookie_status,
         "version": "1.0.0",
         "cookie_status": {
             "available": global_data["cookie"] is not None,
@@ -239,7 +371,7 @@ async def health_check():
                 padding: 4px 8px;
                 border-radius: 4px;
                 font-weight: bold;
-                background-color: #4CAF50;
+                background-color: {cookie_status_color};
                 color: white;
             }}
             .info {{
@@ -262,7 +394,15 @@ async def health_check():
                 border-radius: 4px;
             }}
             .cookie-status .available {{
-                color: {"#4CAF50" if status["cookie_status"]["available"] else "#f44336"};
+                color: {cookie_status_color};
+            }}
+            .error-message {{
+                color: #f44336;
+                margin-top: 10px;
+                padding: 10px;
+                background-color: #ffebee;
+                border-radius: 4px;
+                display: {"block" if cookie_status == "error" else "none"};
             }}
         </style>
     </head>
@@ -290,6 +430,10 @@ async def health_check():
                 <div class="info-item">
                     <span class="label">Expires:</span>
                     <span class="value">{status["cookie_status"]["expires"] or "Unknown"}</span>
+                </div>
+                
+                <div class="error-message">
+                    Cookie retrieval failed. The service may not be fully functional.
                 </div>
             </div>
         </div>
