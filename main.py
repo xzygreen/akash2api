@@ -463,6 +463,12 @@ async def health_check():
         <title>Akash API 服务状态</title>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <script>
+            // 每30秒自动刷新页面
+            setTimeout(function() {{
+                location.reload();
+            }}, 30000);
+        </script>
         <style>
             body {{
                 font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
