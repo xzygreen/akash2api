@@ -92,11 +92,14 @@ logger.info(f"OPENAI_API_KEY is set: {OPENAI_API_KEY is not None}")
 
 def get_cookie():
     """获取 cookie 的函数"""
+    browser = None
+    context = None
+    page = None
+    
     try:
         logger.info("Starting cookie retrieval process...")
         
         with sync_playwright() as p:
-            browser = None
             try:
                 # 启动浏览器
                 logger.info("Launching browser...")
@@ -186,16 +189,12 @@ def get_cookie():
                 
                 if not cookies:
                     logger.error("No cookies found")
-                    if browser:
-                        browser.close()
                     return None
                     
                 # 检查是否有 cf_clearance cookie
                 cf_cookie = next((cookie for cookie in cookies if cookie['name'] == 'cf_clearance'), None)
                 if not cf_cookie:
                     logger.error("cf_clearance cookie not found")
-                    if browser:
-                        browser.close()
                     return None
                     
                 # 构建 cookie 字符串
@@ -215,8 +214,6 @@ def get_cookie():
                     logger.info("No explicit expiration in session_token cookie, setting default 1 hour expiration")
                 
                 logger.info("Successfully retrieved cookies")
-                if browser:
-                    browser.close()
                 return cookie_str
                 
             except Exception as e:
@@ -224,15 +221,40 @@ def get_cookie():
                 logger.error(f"Error type: {type(e)}")
                 import traceback
                 logger.error(f"Traceback: {traceback.format_exc()}")
-                if browser:
-                    browser.close()
                 return None
-                
+            finally:
+                # 确保资源被正确关闭
+                try:
+                    if page:
+                        logger.info("Closing page...")
+                        page.close()
+                except Exception as e:
+                    logger.error(f"Error closing page: {e}")
+                    
+                try:
+                    if context:
+                        logger.info("Closing context...")
+                        context.close()
+                except Exception as e:
+                    logger.error(f"Error closing context: {e}")
+                    
+                try:
+                    if browser:
+                        logger.info("Closing browser...")
+                        browser.close()
+                except Exception as e:
+                    logger.error(f"Error closing browser: {e}")
+                    
     except Exception as e:
         logger.error(f"Error fetching cookie: {str(e)}")
         logger.error(f"Error type: {type(e)}")
         import traceback
         logger.error(f"Traceback: {traceback.format_exc()}")
+    
+    # 主动触发垃圾回收
+    import gc
+    gc.collect()
+    
     return None
 
 # 添加刷新 cookie 的函数
@@ -1194,21 +1216,41 @@ def auto_refresh_cookie():
     while True:
         try:
             current_time = time.time()
-            # 如果 cookie 存在且将在1分钟内过期，且当前没有刷新操作在进行
-            if (global_data["cookie"] and 
-                global_data["cookie_expires"] - current_time < 60 and 
+            # 如果 cookie 不存在、已过期或将在1分钟内过期，且当前没有刷新操作在进行
+            if ((not global_data["cookie"] or 
+                 current_time >= global_data["cookie_expires"] or
+                 global_data["cookie_expires"] - current_time < 60) and 
                 not global_data["is_refreshing"]):
-                logger.info("Cookie will expire in less than 1 minute, starting auto-refresh")
+                
+                logger.info(f"Cookie status check: exists={bool(global_data['cookie'])}, expires_in={global_data['cookie_expires'] - current_time if global_data['cookie_expires'] > 0 else 'expired'}")
+                logger.info("Cookie expired or will expire soon, starting auto-refresh")
+                
                 try:
                     global_data["is_refreshing"] = True
-                    get_cookie_with_retry()
+                    # 直接调用 get_cookie 而不是 get_cookie_with_retry
+                    new_cookie = get_cookie()
+                    if new_cookie:
+                        logger.info("Auto-refresh successful")
+                    else:
+                        logger.error("Auto-refresh failed, will retry later")
+                except Exception as e:
+                    logger.error(f"Error during cookie refresh: {e}")
+                    import traceback
+                    logger.error(f"Traceback: {traceback.format_exc()}")
                 finally:
                     global_data["is_refreshing"] = False
+                    # 强制执行垃圾回收，释放内存
+                    import gc
+                    gc.collect()
+            
             # 每30秒检查一次
             time.sleep(30)
         except Exception as e:
             logger.error(f"Error in auto-refresh thread: {e}")
             global_data["is_refreshing"] = False  # 确保出错时也重置标志
+            # 强制执行垃圾回收，释放内存
+            import gc
+            gc.collect()
             time.sleep(30)  # 出错后等待30秒再继续
 
 if __name__ == '__main__':
