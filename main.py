@@ -19,6 +19,8 @@ import logging
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
 from datetime import datetime, timezone, timedelta
+from concurrent.futures import ThreadPoolExecutor
+import random
 
 # 加载环境变量
 load_dotenv(override=True)
@@ -90,6 +92,67 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", None)
 logger.info(f"OPENAI_API_KEY is set: {OPENAI_API_KEY is not None}")
 # logger.info(f"OPENAI_API_KEY value: {OPENAI_API_KEY}")
 
+def get_random_browser_fingerprint():
+    """生成随机的浏览器指纹"""
+    # 随机选择浏览器版本
+    chrome_versions = ["120", "121", "122", "123", "124", "125"]
+    edge_versions = ["120", "121", "122", "123", "124", "125"]
+    selected_version = random.choice(chrome_versions)
+    edge_version = random.choice(edge_versions)
+    
+    # 随机选择操作系统
+    os_versions = [
+        "Windows NT 10.0; Win64; x64",
+        "Macintosh; Intel Mac OS X 10_15_7",
+        "Macintosh; Intel Mac OS X 11_0_1",
+        "Macintosh; Intel Mac OS X 12_0_1"
+    ]
+    selected_os = random.choice(os_versions)
+    
+    # 随机选择语言偏好
+    languages = [
+        "en-US,en;q=0.9",
+        "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
+        "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
+        "en-GB,en;q=0.9,en-US;q=0.8"
+    ]
+    selected_language = random.choice(languages)
+    
+    # 随机选择视口大小
+    viewport_sizes = [
+        (1920, 1080),
+        (1366, 768),
+        (1440, 900),
+        (1536, 864),
+        (1680, 1050)
+    ]
+    selected_viewport = random.choice(viewport_sizes)
+    
+    # 构建用户代理字符串
+    user_agent = f"Mozilla/5.0 ({selected_os}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{selected_version}.0.0.0 Safari/537.36 Edg/{edge_version}.0.0.0"
+    
+    # 构建请求头
+    headers = {
+        "accept": "*/*",
+        "accept-language": selected_language,
+        "content-type": "application/json",
+        "origin": "https://chat.akash.network",
+        "referer": "https://chat.akash.network/",
+        "sec-ch-ua": f'"Microsoft Edge";v="{edge_version}", "Not-A.Brand";v="8", "Chromium";v="{selected_version}"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"macOS"',
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "user-agent": user_agent
+    }
+    
+    return {
+        "headers": headers,
+        "viewport": selected_viewport,
+        "user_agent": user_agent
+    }
+
 def get_cookie():
     """获取 cookie 的函数"""
     browser = None
@@ -98,6 +161,10 @@ def get_cookie():
     
     try:
         logger.info("Starting cookie retrieval process...")
+        
+        # 获取随机浏览器指纹
+        fingerprint = get_random_browser_fingerprint()
+        logger.info(f"Using browser fingerprint: {fingerprint['user_agent']}")
         
         with sync_playwright() as p:
             try:
@@ -115,34 +182,35 @@ def get_cookie():
                         '--no-first-run',
                         '--no-zygote',
                         '--single-process',
-                        '--window-size=1920,1080',
-                        '--disable-blink-features=AutomationControlled'  # 禁用自动化控制检测
+                        f'--window-size={fingerprint["viewport"][0]},{fingerprint["viewport"][1]}',
+                        '--disable-blink-features=AutomationControlled',
+                        '--disable-features=IsolateOrigins,site-per-process'
                     ]
                 )
                 
                 logger.info("Browser launched successfully")
                 
-                # 创建上下文，添加更多浏览器特征
+                # 创建上下文，使用随机指纹
                 logger.info("Creating browser context...")
                 context = browser.new_context(
-                    viewport={'width': 1920, 'height': 1080},
-                    user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    viewport={'width': fingerprint["viewport"][0], 'height': fingerprint["viewport"][1]},
+                    user_agent=fingerprint["user_agent"],
                     locale='en-US',
                     timezone_id='America/New_York',
                     permissions=['geolocation'],
-                    extra_http_headers={
-                        'Accept-Language': 'en-US,en;q=0.9',
-                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-                        'Sec-Ch-Ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-                        'Sec-Ch-Ua-Mobile': '?0',
-                        'Sec-Ch-Ua-Platform': '"macOS"',
-                        'Sec-Fetch-Dest': 'document',
-                        'Sec-Fetch-Mode': 'navigate',
-                        'Sec-Fetch-Site': 'none',
-                        'Sec-Fetch-User': '?1',
-                        'Upgrade-Insecure-Requests': '1'
-                    }
+                    extra_http_headers=fingerprint["headers"]
                 )
+                
+                # 添加脚本以覆盖 navigator.webdriver
+                context.add_init_script("""
+                    Object.defineProperty(navigator, 'webdriver', {
+                        get: () => false,
+                    });
+                    // 更多指纹伪装
+                    Object.defineProperty(navigator, 'plugins', {
+                        get: () => [1, 2, 3, 4, 5],
+                    });
+                """)
                 
                 logger.info("Browser context created successfully")
                 
@@ -154,9 +222,20 @@ def get_cookie():
                 # 设置页面超时
                 page.set_default_timeout(60000)
                 
-                # 访问目标网站
-                logger.info("Navigating to target website...")
-                page.goto("https://chat.akash.network/", timeout=50000)
+                # 访问目标网站，添加重试机制
+                max_retries = 3
+                retry_delay = 5
+                
+                for attempt in range(max_retries):
+                    try:
+                        logger.info(f"Navigating to target website (attempt {attempt + 1}/{max_retries})...")
+                        page.goto("https://chat.akash.network/", timeout=50000)
+                        break
+                    except Exception as e:
+                        if attempt == max_retries - 1:
+                            raise
+                        logger.warning(f"Navigation attempt {attempt + 1} failed: {e}")
+                        time.sleep(retry_delay)
                 
                 # 等待页面加载
                 logger.info("Waiting for page load...")
@@ -167,21 +246,34 @@ def get_cookie():
                     
                     # 等待一段时间，让 Cloudflare 检查完成
                     logger.info("Waiting for Cloudflare check...")
-                    time.sleep(3)
+                    time.sleep(5)
                     
                     # 尝试点击页面，模拟用户行为
                     try:
                         page.mouse.move(100, 100)
                         page.mouse.click(100, 100)
                         logger.info("Simulated user interaction")
+                        
+                        # 随机滚动页面
+                        page.mouse.wheel(0, 100)
+                        time.sleep(0.5)
+                        page.mouse.wheel(0, -50)
+                        logger.info("Simulated scrolling")
                     except Exception as e:
                         logger.warning(f"Failed to simulate user interaction: {e}")
                     
                     # 再次等待一段时间
-                    time.sleep(3)
+                    time.sleep(5)
                     
                 except Exception as e:
                     logger.warning(f"Timeout waiting for load state: {e}")
+                
+                # 等待更长时间确保页面完全加载
+                try:
+                    page.wait_for_load_state("networkidle", timeout=10000)
+                    logger.info("Network idle reached")
+                except Exception as e:
+                    logger.warning(f"Timeout waiting for network idle: {e}")
                 
                 # 获取 cookies
                 logger.info("Getting cookies...")
@@ -190,28 +282,39 @@ def get_cookie():
                 if not cookies:
                     logger.error("No cookies found")
                     return None
+                
+                # 记录所有 cookie 名称以进行调试
+                cookie_names = [cookie['name'] for cookie in cookies]
+                logger.info(f"Retrieved cookies: {cookie_names}")
                     
                 # 检查是否有 cf_clearance cookie
                 cf_cookie = next((cookie for cookie in cookies if cookie['name'] == 'cf_clearance'), None)
                 if not cf_cookie:
                     logger.error("cf_clearance cookie not found")
                     return None
+                
+                # 检查是否有 session_token cookie
+                session_cookie = next((cookie for cookie in cookies if cookie['name'] == 'session_token'), None)
+                if not session_cookie:
+                    logger.error("session_token cookie not found")
+                    # 继续执行，因为某些情况下可能不需要 session_token
                     
                 # 构建 cookie 字符串
                 cookie_str = '; '.join([f"{cookie['name']}={cookie['value']}" for cookie in cookies])
+                logger.info(f"Cookie string length: {len(cookie_str)}")
+                
                 global_data["cookie"] = cookie_str
                 global_data["cookies"] = cookies  # 保存完整的 cookies 列表
                 global_data["last_update"] = time.time()
                 
-                # 查找 session_token cookie 的过期时间
-                session_cookie = next((cookie for cookie in cookies if cookie['name'] == 'session_token'), None)
+                # 设置 cookie 过期时间
                 if session_cookie and 'expires' in session_cookie and session_cookie['expires'] > 0:
                     global_data["cookie_expires"] = session_cookie['expires']
                     logger.info(f"Session token expires at: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(session_cookie['expires']))}")
                 else:
-                    # 如果没有明确的过期时间，默认设置为1小时后过期
-                    global_data["cookie_expires"] = time.time() + 3600
-                    logger.info("No explicit expiration in session_token cookie, setting default 1 hour expiration")
+                    # 如果没有明确的过期时间，默认设置为30分钟后过期
+                    global_data["cookie_expires"] = time.time() + 1800  # 30 分钟
+                    logger.info("No explicit expiration in session_token cookie, setting default 30 minute expiration")
                 
                 logger.info("Successfully retrieved cookies")
                 return cookie_str
@@ -227,29 +330,68 @@ def get_cookie():
                 try:
                     if page:
                         logger.info("Closing page...")
-                        page.close()
+                        try:
+                            page.close()
+                            logger.info("Page closed successfully")
+                        except Exception as e:
+                            logger.error(f"Error closing page: {e}")
                 except Exception as e:
-                    logger.error(f"Error closing page: {e}")
-                    
+                    logger.error(f"Error in page cleanup: {e}")
+                
                 try:
                     if context:
                         logger.info("Closing context...")
-                        context.close()
+                        try:
+                            context.close()
+                            logger.info("Context closed successfully")
+                        except Exception as e:
+                            logger.error(f"Error closing context: {e}")
                 except Exception as e:
-                    logger.error(f"Error closing context: {e}")
-                    
+                    logger.error(f"Error in context cleanup: {e}")
+                
                 try:
                     if browser:
                         logger.info("Closing browser...")
-                        browser.close()
+                        try:
+                            browser.close()
+                            logger.info("Browser closed successfully")
+                        except Exception as e:
+                            logger.error(f"Error closing browser: {e}")
                 except Exception as e:
-                    logger.error(f"Error closing browser: {e}")
-                    
+                    logger.error(f"Error in browser cleanup: {e}")
+                
+                # 确保所有资源都被清理
+                page = None
+                context = None
+                browser = None
+                
+                # 主动触发垃圾回收
+                import gc
+                gc.collect()
+                logger.info("Resource cleanup completed")
+    
     except Exception as e:
         logger.error(f"Error fetching cookie: {str(e)}")
         logger.error(f"Error type: {type(e)}")
         import traceback
         logger.error(f"Traceback: {traceback.format_exc()}")
+    
+    # 最后再次确保资源被清理
+    if page:
+        try:
+            page.close()
+        except:
+            pass
+    if context:
+        try:
+            context.close()
+        except:
+            pass
+    if browser:
+        try:
+            browser.close()
+        except:
+            pass
     
     # 主动触发垃圾回收
     import gc
@@ -280,8 +422,10 @@ async def refresh_cookie():
         global_data["is_refreshing"] = True
         # 标记 cookie 为过期
         global_data["cookie_expires"] = 0
-        # 获取新的 cookie
-        new_cookie = get_cookie()
+        # 调用同步函数进行cookie获取，使用线程池不阻塞事件循环
+        executor = ThreadPoolExecutor(max_workers=1)
+        loop = asyncio.get_event_loop()
+        new_cookie = await loop.run_in_executor(executor, get_cookie_with_retry)
         return new_cookie
     finally:
         global_data["is_refreshing"] = False
@@ -295,7 +439,12 @@ async def background_refresh_cookie():
     try:
         global_data["is_refreshing"] = True
         logger.info("Starting background cookie refresh")
-        new_cookie = get_cookie()
+        
+        # 使用线程池执行同步函数
+        executor = ThreadPoolExecutor(max_workers=1)
+        loop = asyncio.get_event_loop()
+        new_cookie = await loop.run_in_executor(executor, get_cookie)
+        
         if new_cookie:
             logger.info("Background cookie refresh successful")
             # 更新 cookie 和过期时间
@@ -307,9 +456,9 @@ async def background_refresh_cookie():
                 global_data["cookie_expires"] = session_cookie['expires']
                 logger.info(f"Session token expires at: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(session_cookie['expires']))}")
             else:
-                # 如果没有明确的过期时间，默认设置为1小时后过期
-                global_data["cookie_expires"] = time.time() + 3600
-                logger.info("No explicit expiration in session_token cookie, setting default 1 hour expiration")
+                # 如果没有明确的过期时间，默认设置为30分钟后过期
+                global_data["cookie_expires"] = time.time() + 1800
+                logger.info("No explicit expiration in session_token cookie, setting default 30 minute expiration")
         else:
             logger.error("Background cookie refresh failed")
     except Exception as e:
@@ -317,18 +466,34 @@ async def background_refresh_cookie():
     finally:
         global_data["is_refreshing"] = False
 
-async def check_and_update_cookie(background_tasks: BackgroundTasks):
-    # 如果 cookie 不存在或已过期，则更新
-    current_time = time.time()
-    if not global_data["cookie"] or current_time >= global_data["cookie_expires"]:
-        logger.info("Cookie expired or not available, refreshing...")
-        background_tasks.add_task(get_cookie)
-    else:
-        logger.info("Using existing cookie")
-        # 检查是否需要提前刷新（过期前一分钟）
-        if global_data["cookie_expires"] - current_time < 60 and not global_data["is_refreshing"]:
-            logger.info("Cookie will expire in less than 1 minute, scheduling background refresh")
-            background_tasks.add_task(background_refresh_cookie)
+async def check_and_update_cookie():
+    """检查并更新 cookie"""
+    try:
+        current_time = time.time()
+        # 只在 cookie 不存在或已过期时刷新
+        if not global_data["cookie"] or current_time >= global_data["cookie_expires"]:
+            logger.info("Cookie expired or not available, starting refresh")
+            try:
+                # 使用线程池执行同步的 get_cookie 函数
+                loop = asyncio.get_event_loop()
+                with ThreadPoolExecutor() as executor:
+                    new_cookie = await loop.run_in_executor(executor, get_cookie)
+                
+                if new_cookie:
+                    logger.info("Cookie refresh successful")
+                else:
+                    logger.error("Cookie refresh failed")
+            except Exception as e:
+                logger.error(f"Error during cookie refresh: {e}")
+                import traceback
+                logger.error(f"Traceback: {traceback.format_exc()}")
+        else:
+            logger.info("Using existing cookie")
+            
+    except Exception as e:
+        logger.error(f"Error in check_and_update_cookie: {e}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
 
 async def get_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
     token = credentials.credentials
@@ -351,7 +516,7 @@ async def get_api_key(credentials: HTTPAuthorizationCredentials = Depends(securi
 
 async def validate_cookie(background_tasks: BackgroundTasks):
     # 检查并更新 cookie（如果需要）
-    await check_and_update_cookie(background_tasks)
+    await check_and_update_cookie()
     
     # 等待 cookie 初始化完成
     max_wait = 30  # 最大等待时间（秒）
@@ -804,62 +969,76 @@ async def chat_completions(
     try:
         data = await request.json()
         
+        # 获取随机浏览器指纹
+        fingerprint = get_random_browser_fingerprint()
+        logger.info(f"Using browser fingerprint: {fingerprint['user_agent']}")
+        
         chat_id = str(uuid.uuid4()).replace('-', '')[:16]
         
+        # 确保系统消息正确处理
+        system_message = data.get('system_message') or data.get('system', "You are a helpful assistant.")
+        
+        # 更新请求数据格式，与实际 Akash API 请求保持一致
         akash_data = {
             "id": chat_id,
             "messages": data.get('messages', []),
             "model": data.get('model', "DeepSeek-R1"),
-            "system": data.get('system_message', "You are a helpful assistant."),
+            "system": system_message,
             "temperature": data.get('temperature', 0.6),
-            "topP": data.get('top_p', 0.95)
+            "topP": data.get('top_p', 0.95),
+            "context": []  # 添加 context 字段
         }
         
-        # 构建请求头
-        headers = {
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "*/*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Origin": "https://chat.akash.network",
-            "Referer": "https://chat.akash.network/",
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-origin",
-            "Connection": "keep-alive"
-        }
-        
-        # 设置 Cookie
-        headers["Cookie"] = cookie
+        # 记录当前使用的 cookie（部分隐藏）
+        cookie_start = cookie[:20]
+        cookie_end = cookie[-20:] if len(cookie) > 40 else ""
+        logger.info(f"Using cookie: {cookie_start}...{cookie_end}")
         
         with requests.Session() as session:
+            # 设置 Cookie 使用请求头方式
+            session.headers.update(fingerprint["headers"])
+            cookies_dict = {}
+            
+            # 解析 cookie 字符串到字典
+            for cookie_item in cookie.split(';'):
+                if '=' in cookie_item:
+                    name, value = cookie_item.strip().split('=', 1)
+                    cookies_dict[name] = value
+            
+            # 使用 cookies 参数而不是 headers['Cookie']
             response = session.post(
                 'https://chat.akash.network/api/chat',
                 json=akash_data,
-                headers=headers,
+                cookies=cookies_dict,
                 stream=True
             )
             
-            # 检查响应状态码，如果是 401，尝试刷新 cookie 并重试
-            if response.status_code == 401:
-                logger.info("Cookie expired, refreshing...")
+            # 检查响应状态码，如果是 401 或 403，尝试刷新 cookie 并重试
+            if response.status_code in [401, 403]:
+                logger.info(f"Authentication failed with status {response.status_code}, refreshing cookie...")
                 new_cookie = await refresh_cookie()
                 if new_cookie:
-                    headers["Cookie"] = new_cookie
+                    logger.info("Successfully refreshed cookie, retrying request")
+                    # 解析新 cookie 字符串到字典
+                    new_cookies_dict = {}
+                    for cookie_item in new_cookie.split(';'):
+                        if '=' in cookie_item:
+                            name, value = cookie_item.strip().split('=', 1)
+                            new_cookies_dict[name] = value
+                    
                     response = session.post(
                         'https://chat.akash.network/api/chat',
                         json=akash_data,
-                        headers=headers,
+                        cookies=new_cookies_dict,
                         stream=True
                     )
             
-            if response.status_code != 200:
-                logger.error(f"Akash API error: {response.text}")
+            if response.status_code not in [200, 201]:
+                logger.error(f"Akash API error: Status {response.status_code}, Response: {response.text}")
                 raise HTTPException(
                     status_code=response.status_code,
                     detail=f"Akash API error: {response.text}"
-            )
+                )
             
             def generate():
                 content_buffer = ""
@@ -881,7 +1060,7 @@ async def chat_completions(
                             if data.get('model') == 'AkashGen' and "<image_generation>" in msg_data:
                                 # 图片生成模型的特殊处理
                                 async def process_and_send():
-                                    messages = await process_image_generation(msg_data, session, headers, chat_id)
+                                    messages = await process_image_generation(msg_data, session, fingerprint["headers"], chat_id)
                                     if messages:
                                         return messages
                                     return None
@@ -956,87 +1135,112 @@ async def list_models(
     cookie: str = Depends(validate_cookie)
 ):
     try:
-        headers = {
-            "accept": "application/json",
-            "accept-language": "en-US,en;q=0.9",
-            "sec-ch-ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"macOS"',
-            "sec-fetch-dest": "document",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "same-origin",
-            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "referer": "https://chat.akash.network/"
-        }
+        # 获取随机浏览器指纹
+        fingerprint = get_random_browser_fingerprint()
+        logger.info(f"Using browser fingerprint: {fingerprint['user_agent']}")
         
-        # 设置 Cookie
-        headers["Cookie"] = cookie
+        # 构建更符合实际请求的请求头
+        headers = fingerprint["headers"]
         
-        print(f"Using cookie: {headers.get('Cookie', 'None')}")
-        print("Sending request to get models...")
+        # 记录当前使用的 cookie（部分隐藏）
+        cookie_start = cookie[:20]
+        cookie_end = cookie[-20:] if len(cookie) > 40 else ""
+        logger.info(f"Using cookie: {cookie_start}...{cookie_end}")
+        logger.info("Sending request to get models...")
         
-        response = requests.get(
-            'https://chat.akash.network/api/models',
-            headers=headers
-        )
+        with requests.Session() as session:
+            # 设置会话的默认请求头
+            session.headers.update(headers)
+            
+            # 解析 cookie 字符串到字典
+            cookies_dict = {}
+            for cookie_item in cookie.split(';'):
+                if '=' in cookie_item:
+                    name, value = cookie_item.strip().split('=', 1)
+                    cookies_dict[name] = value
+            
+            response = session.get(
+                'https://chat.akash.network/api/models',
+                cookies=cookies_dict
+            )
+            
+            logger.info(f"Models response status: {response.status_code}")
         
-        print(f"Models response status: {response.status_code}")
-        print(f"Models response headers: {response.headers}")
+            # 检查响应状态码，如果是 401 或 403，尝试刷新 cookie 并重试
+            if response.status_code in [401, 403]:
+                logger.info(f"Authentication failed with status {response.status_code}, refreshing cookie...")
+                new_cookie = await refresh_cookie()
+                if new_cookie:
+                    logger.info("Successfully refreshed cookie, retrying request")
+                    
+                    # 解析新 cookie 字符串到字典
+                    new_cookies_dict = {}
+                    for cookie_item in new_cookie.split(';'):
+                        if '=' in cookie_item:
+                            name, value = cookie_item.strip().split('=', 1)
+                            new_cookies_dict[name] = value
+                    
+                    response = session.get(
+                        'https://chat.akash.network/api/models',
+                        cookies=new_cookies_dict
+                    )
         
-        if response.status_code == 401:
-            print("Authentication failed. Please check your API key.")
-            return {"error": "Authentication failed. Please check your API key."}
+            if response.status_code not in [200, 201]:
+                logger.error(f"Akash API error: Status {response.status_code}, Response: {response.text}")
+                return {"error": f"Authentication failed. Status: {response.status_code}"}
         
-        akash_response = response.json()
-        
-        # 添加错误处理和调试信息
-        print(f"Akash API response: {akash_response}")
-        
-        # 检查响应格式并适配
-        models_list = []
-        if isinstance(akash_response, list):
-            # 如果直接是列表
-            models_list = akash_response
-        elif isinstance(akash_response, dict):
-            # 如果是字典格式
-            models_list = akash_response.get("models", [])
-        else:
-            print(f"Unexpected response format: {type(akash_response)}")
+            try:
+                akash_response = response.json()
+                logger.info(f"Received models data of type: {type(akash_response)}")
+            except ValueError:
+                logger.error(f"Invalid JSON response: {response.text[:100]}...")
+                return {"error": "Invalid response format"}
+            
+            # 检查响应格式并适配
             models_list = []
-        
-        # 转换为标准 OpenAI 格式
-        openai_models = {
-            "object": "list",
-            "data": [
-                {
-                    "id": model["id"] if isinstance(model, dict) else model,
-                    "object": "model",
-                    "created": int(time.time()),
-                    "owned_by": "akash",
-                    "permission": [{
-                        "id": f"modelperm-{model['id'] if isinstance(model, dict) else model}",
-                        "object": "model_permission",
+            if isinstance(akash_response, list):
+                # 如果直接是列表
+                models_list = akash_response
+            elif isinstance(akash_response, dict):
+                # 如果是字典格式
+                models_list = akash_response.get("models", [])
+            else:
+                logger.error(f"Unexpected response format: {type(akash_response)}")
+                models_list = []
+            
+            # 转换为标准 OpenAI 格式
+            openai_models = {
+                "object": "list",
+                "data": [
+                    {
+                        "id": model["id"] if isinstance(model, dict) else model,
+                        "object": "model",
                         "created": int(time.time()),
-                        "allow_create_engine": False,
-                        "allow_sampling": True,
-                        "allow_logprobs": True,
-                        "allow_search_indices": False,
-                        "allow_view": True,
-                        "allow_fine_tuning": False,
-                        "organization": "*",
-                        "group": None,
-                        "is_blocking": False
-                    }]
-                } for model in models_list
-            ]
-        }
-        
-        return openai_models
-        
+                        "owned_by": "akash",
+                        "permission": [{
+                            "id": f"modelperm-{model['id'] if isinstance(model, dict) else model}",
+                            "object": "model_permission",
+                            "created": int(time.time()),
+                            "allow_create_engine": False,
+                            "allow_sampling": True,
+                            "allow_logprobs": True,
+                            "allow_search_indices": False,
+                            "allow_view": True,
+                            "allow_fine_tuning": False,
+                            "organization": "*",
+                            "group": None,
+                            "is_blocking": False
+                        }]
+                    } for model in models_list
+                ]
+            }
+            
+            return openai_models
+            
     except Exception as e:
-        print(f"Error in list_models: {e}")
+        logger.error(f"Error in list_models: {e}")
         import traceback
-        print(traceback.format_exc())
+        logger.error(f"Traceback: {traceback.format_exc()}")
         return {"error": str(e)}
 
 async def process_image_generation(msg_data: str, session: requests.Session, headers: dict, chat_id: str) -> Optional[list]:
@@ -1216,23 +1420,20 @@ def auto_refresh_cookie():
     while True:
         try:
             current_time = time.time()
-            # 如果 cookie 不存在、已过期或将在1分钟内过期，且当前没有刷新操作在进行
-            if ((not global_data["cookie"] or 
-                 current_time >= global_data["cookie_expires"] or
-                 global_data["cookie_expires"] - current_time < 60) and 
-                not global_data["is_refreshing"]):
+            # 只在 cookie 不存在或已过期时刷新
+            if (not global_data["cookie"] or 
+                current_time >= global_data["cookie_expires"]) and not global_data["is_refreshing"]:
                 
                 logger.info(f"Cookie status check: exists={bool(global_data['cookie'])}, expires_in={global_data['cookie_expires'] - current_time if global_data['cookie_expires'] > 0 else 'expired'}")
-                logger.info("Cookie expired or will expire soon, starting auto-refresh")
+                logger.info("Cookie expired or not available, starting refresh")
                 
                 try:
                     global_data["is_refreshing"] = True
-                    # 直接调用 get_cookie 而不是 get_cookie_with_retry
                     new_cookie = get_cookie()
                     if new_cookie:
-                        logger.info("Auto-refresh successful")
+                        logger.info("Cookie refresh successful")
                     else:
-                        logger.error("Auto-refresh failed, will retry later")
+                        logger.error("Cookie refresh failed, will retry later")
                 except Exception as e:
                     logger.error(f"Error during cookie refresh: {e}")
                     import traceback
@@ -1243,15 +1444,15 @@ def auto_refresh_cookie():
                     import gc
                     gc.collect()
             
-            # 每30秒检查一次
-            time.sleep(30)
+            # 每60秒检查一次
+            time.sleep(60)
         except Exception as e:
             logger.error(f"Error in auto-refresh thread: {e}")
             global_data["is_refreshing"] = False  # 确保出错时也重置标志
             # 强制执行垃圾回收，释放内存
             import gc
             gc.collect()
-            time.sleep(30)  # 出错后等待30秒再继续
+            time.sleep(60)  # 出错后等待60秒再继续
 
 if __name__ == '__main__':
     import uvicorn
