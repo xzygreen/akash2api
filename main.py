@@ -536,17 +536,37 @@ async def validate_cookie(background_tasks: BackgroundTasks):
     logger.info("Cookie validation passed")
     return global_data["cookie"]
 
-async def check_image_status(session: requests.Session, job_id: str, headers: dict) -> Optional[str]:
+async def check_image_status(session: requests.Session, full_job_id: str, short_job_id: str, headers: dict) -> Optional[str]:
     """检查图片生成状态并获取生成的图片"""
     max_retries = 30
     for attempt in range(max_retries):
         try:
-            print(f"\nAttempt {attempt + 1}/{max_retries} for job {job_id}")
+            print(f"\nAttempt {attempt + 1}/{max_retries} for job {full_job_id}")
             response = session.get(
-                f'https://chat.akash.network/api/image-status?ids={job_id}',
+                f'https://chat.akash.network/api/image-status?ids={full_job_id}',
                 headers=headers
             )
             print(f"Status response code: {response.status_code}")
+            
+            # 如果是404，说明任务已经不存在，可能已经完成并被清理
+            if response.status_code == 404:
+                print(f"Job {full_job_id} not found (404), task may have been completed and cleaned up")
+                # 连续3次404就停止重试
+                if hasattr(check_image_status, '_consecutive_404s'):
+                    check_image_status._consecutive_404s += 1
+                else:
+                    check_image_status._consecutive_404s = 1
+                
+                if check_image_status._consecutive_404s >= 3:
+                    print(f"Stopping after {check_image_status._consecutive_404s} consecutive 404s")
+                    return None
+                
+                await asyncio.sleep(1)
+                continue
+            else:
+                # 重置404计数器
+                check_image_status._consecutive_404s = 0
+                
             status_data = response.json()
             
             if status_data and isinstance(status_data, list) and len(status_data) > 0:
@@ -554,21 +574,65 @@ async def check_image_status(session: requests.Session, job_id: str, headers: di
                 status = job_info.get('status')
                 print(f"Job status: {status}")
                 
-                # 只有当状态为 completed 时才处理结果
-                if status == "completed":
+                # 检查状态为 completed 或 succeeded 时处理结果
+                if status in ["completed", "succeeded"]:
                     result = job_info.get("result")
+                    print(f"API returned result: {result}")
+                    print(f"Full job_info: {job_info}")
+                    
                     if result and not result.startswith("Failed"):
-                        print("Got valid result, attempting upload...")
-                        image_url = await upload_to_xinyew(result, job_id)
-                        if image_url:
-                            print(f"Successfully uploaded image: {image_url}")
-                            return image_url
-                        print("Image upload failed")
-                        return None
+                        print("Got valid result...")
+                        
+                        # 如果result是相对路径，下载并上传到图床（因为直接访问需要认证）
+                        if result.startswith("/api/image/"):
+                            image_url = f"https://chat.akash.network{result}"
+                            print(f"Downloading image from: {image_url}")
+                            
+                            try:
+                                # 使用当前session和headers下载图片（包含认证信息）
+                                image_response = session.get(image_url, headers=headers)
+                                print(f"Download response status: {image_response.status_code}")
+                                
+                                if image_response.status_code == 200:
+                                    print("Successfully downloaded image, uploading to image host...")
+                                    print(f"Image content length: {len(image_response.content)} bytes")
+                                    
+                                    # 上传到新野图床
+                                    upload_url = await upload_to_xinyew(image_response.content, full_job_id)
+                                    if upload_url:
+                                        print(f"Successfully uploaded image: {upload_url}")
+                                        return upload_url
+                                    print("Image upload failed")
+                                    return None
+                                else:
+                                    print(f"Failed to download image, status: {image_response.status_code}")
+                                    print(f"Response content: {image_response.text[:200]}...")
+                                    return None
+                            except Exception as e:
+                                print(f"Error downloading image: {e}")
+                                import traceback
+                                print(traceback.format_exc())
+                                return None
+                        # 如果result不是完整路径，可能需要构建图片URL
+                        elif result and not result.startswith("http"):
+                            # 从result构建图片URL，格式: /api/image/job_{short_id}_00001_.webp
+                            if not result.startswith("/"):
+                                image_url = f"https://chat.akash.network/api/image/job_{short_job_id}_00001_.webp"
+                                print(f"Constructed Akash image URL: {image_url}")
+                                return image_url
+                        else:
+                            # 如果result是base64数据，上传到图床
+                            print("Got base64 result, uploading to image host...")
+                            upload_url = await upload_to_mjj(result, job_id)
+                            if upload_url:
+                                print(f"Successfully uploaded image: {upload_url}")
+                                return upload_url
+                            print("Image upload failed")
+                            return None
                     print("Invalid result received")
                     return None
                 elif status == "failed":
-                    print(f"Job {job_id} failed")
+                    print(f"Job {full_job_id} failed")
                     return None
                 
                 # 如果状态是其他（如 pending），继续等待
@@ -579,7 +643,7 @@ async def check_image_status(session: requests.Session, job_id: str, headers: di
             print(f"Error checking status: {e}")
             return None
     
-    print(f"Timeout waiting for job {job_id}")
+    print(f"Timeout waiting for job {full_job_id}")
     return None
 
 @app.get("/", response_class=HTMLResponse)
@@ -978,14 +1042,24 @@ async def chat_completions(
         # 确保系统消息正确处理
         system_message = data.get('system_message') or data.get('system', "You are a helpful assistant.")
         
+        # 处理messages格式，确保与官网格式一致
+        processed_messages = []
+        for msg in data.get('messages', []):
+            processed_msg = {
+                "role": msg.get("role"),
+                "content": msg.get("content"),
+                "parts": [{"type": "text", "text": msg.get("content")}]
+            }
+            processed_messages.append(processed_msg)
+        
         # 更新请求数据格式，与实际 Akash API 请求保持一致
         akash_data = {
             "id": chat_id,
-            "messages": data.get('messages', []),
+            "messages": processed_messages,
             "model": data.get('model', "DeepSeek-R1"),
             "system": system_message,
-            "temperature": data.get('temperature', 0.6),
-            "topP": data.get('top_p', 0.95),
+            "temperature": data.get('temperature', 0.85 if data.get('model') == 'AkashGen' else 0.6),
+            "topP": data.get('top_p', 1.0 if data.get('model') == 'AkashGen' else 0.95),
             "context": []  # 添加 context 字段
         }
         
@@ -1263,6 +1337,14 @@ async def process_image_generation(msg_data: str, session: requests.Session, hea
         return create_error_messages(chat_id, "Akash服务异常，无法获取有效的任务ID。请稍后再试。")
     
     print(f"Starting image generation process for job_id: {job_id}")
+    print(f"Job ID format check - Length: {len(job_id)}, Contains hyphens: {'-' in job_id}")
+    
+    # 确保job_id是完整的UUID格式（用于状态查询）
+    full_job_id = job_id
+    # 从job_id中提取短格式（用于构建图片URL）
+    short_job_id = job_id.replace('-', '')[:8] if '-' in job_id else job_id[:8]
+    print(f"Full job ID for status: {full_job_id}")
+    print(f"Short job ID for image URL: {short_job_id}")
     
     # 记录开始时间
     start_time = time.time()
@@ -1274,7 +1356,7 @@ async def process_image_generation(msg_data: str, session: requests.Session, hea
     
     try:
         # 检查图片状态和上传
-        result = await check_image_status(session, job_id, headers)
+        result = await check_image_status(session, full_job_id, short_job_id, headers)
         
         # 计算实际花费的时间
         elapsed_time = time.time() - start_time
@@ -1325,8 +1407,7 @@ async def process_image_generation(msg_data: str, session: requests.Session, hea
                     "index": 0,
                     "finish_reason": None
                 }]
-            })
-        
+            })  
         return messages
     except Exception as e:
         logger.error(f"Error in image generation process: {e}")
@@ -1348,58 +1429,69 @@ def create_error_messages(chat_id: str, error_message: str) -> list:
         }]
     }]
 
-async def upload_to_xinyew(image_base64: str, job_id: str) -> Optional[str]:
+
+
+async def upload_to_xinyew(image_data: bytes, job_id: str) -> Optional[str]:
     """上传图片到新野图床并返回URL"""
     try:
-        print(f"\n=== Starting image upload for job {job_id} ===")
-        print(f"Base64 data length: {len(image_base64)}")
-        
-        # 解码base64图片数据
-        try:
-            image_data = base64.b64decode(image_base64.split(',')[1] if ',' in image_base64 else image_base64)
-            print(f"Decoded image data length: {len(image_data)} bytes")
-        except Exception as e:
-            print(f"Error decoding base64: {e}")
-            print(f"First 100 chars of base64: {image_base64[:100]}...")
-            return None
+        print(f"\n=== Starting image upload to xinyew for job {job_id} ===")
+        print(f"Image data length: {len(image_data)} bytes")
         
         # 创建临时文件
-        with tempfile.NamedTemporaryFile(suffix='.jpeg', delete=False) as temp_file:
+        with tempfile.NamedTemporaryFile(suffix='.webp', delete=False) as temp_file:
             temp_file.write(image_data)
             temp_file_path = temp_file.name
         
         try:
-            filename = f"{job_id}.jpeg"
+            filename = f"{job_id}.webp"
             print(f"Using filename: {filename}")
             
-            # 准备文件上传
+            # 准备表单数据 - 根据API文档，参数名应该是 file
             files = {
-                'file': (filename, open(temp_file_path, 'rb'), 'image/jpeg')
+                'file': (filename, open(temp_file_path, 'rb'), 'image/webp')
             }
             
-            print("Sending request to xinyew.cn...")
+            # 构建请求头
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
+                'Accept': 'application/json, text/javascript, */*; q=0.01',
+                'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+                'Origin': 'https://api.xinyew.cn',
+                'Referer': 'https://api.xinyew.cn/',
+                'X-Requested-With': 'XMLHttpRequest'
+            }
+            
+            print("Sending request to xinyew API...")
             response = requests.post(
-                'https://api.xinyew.cn/api/jdtc',
+                'https://api.xinyew.cn/api/jdtc',  # 使用正确的API地址
                 files=files,
+                headers=headers,
                 timeout=30
             )
             
             print(f"Upload response status: {response.status_code}")
+            print(f"Upload response content: {response.text}")
+            
             if response.status_code == 200:
-                result = response.json()
-                print(f"Upload response: {result}")
-                
-                if result.get('errno') == 0:
-                    url = result.get('data', {}).get('url')
-                    if url:
-                        print(f"Successfully got image URL: {url}")
-                        return url
-                    print("No URL in response data")
-                else:
-                    print(f"Upload failed: {result.get('message')}")
+                try:
+                    result = response.json()
+                    print(f"Parsed JSON result: {result}")
+                    
+                    # 根据API文档，成功时 errno=0，失败时 errno=1
+                    if result.get('errno') == 0 and result.get('data'):
+                        # 从响应中获取图片URL
+                        data = result.get('data', {})
+                        url = data.get('url')
+                        if url:
+                            print(f"Successfully got image URL: {url}")
+                            return url
+                        print("No URL in response data")
+                    else:
+                        print(f"Upload failed: {result.get('message', 'Unknown error')}")
+                except json.JSONDecodeError:
+                    print("Failed to parse JSON response")
             else:
                 print(f"Upload failed with status {response.status_code}")
-                print(f"Response content: {response.text}")
             return None
                 
         finally:
@@ -1414,6 +1506,8 @@ async def upload_to_xinyew(image_base64: str, job_id: str) -> Optional[str]:
         import traceback
         print(traceback.format_exc())
         return None
+
+
 
 def auto_refresh_cookie():
     """自动刷新 cookie 的线程函数"""
