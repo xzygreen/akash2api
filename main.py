@@ -62,7 +62,7 @@ def _lcp_delta(prev: str, curr: str) -> str:
 def _suffix_prefix_overlap(a: str, b: str) -> int:
     """
     返回最大的 k，使得 a 的后缀 a[-k:] == b 的前缀 b[:k]。
-    用于把“已发送文本的尾巴”和“本次候选增量的头部”对齐，去掉任何重复拼接。
+    （保留以备需要；当前主要使用 _emit_from_cumulative）
     """
     max_k = min(len(a), len(b))
     for k in range(max_k, 0, -1):
@@ -74,8 +74,8 @@ def _suffix_prefix_overlap(a: str, b: str) -> int:
 def _novel_suffix(history: str, piece: str) -> str:
     """
     从 piece 中找出“在历史 history 中从未出现过”的最短后缀。
-    若 piece 的所有后缀都已出现过，则返回空串（不必再发）。
-    复杂度 O(n^2)；对对话长度足够，必要时可换 KMP/后缀数组优化。
+    若 piece 的所有后缀都已出现过，则返回空串（这帧无需发送）。
+    O(n^2)，对常规对话长度足够；需要可换 KMP/后缀数组优化。
     """
     n = len(piece)
     for i in range(n):
@@ -83,6 +83,46 @@ def _novel_suffix(history: str, piece: str) -> str:
         if cand and cand not in history:
             return cand
     return ""
+
+
+def _emit_from_cumulative(history: str, curr: str, last: str) -> str:
+    """
+    给定历史已发送文本 history、本帧累计文本 curr、上一帧累计文本 last，
+    返回这帧应该增量发送的文本（保留 <think>）：
+      1) 若 curr 中包含 history（取最后一次出现），仅发送其后的部分；
+      2) 否则找 history 的“最长后缀”在 curr 中的匹配位置，发送其后的部分；
+      3) 再不行，回退到 LCP(last, curr) 的差分；
+      4) 若差分仍是历史已有内容，则取 curr 的“新颖后缀”（history 未出现过的最短后缀）。
+    """
+    if not curr:
+        return ""
+    if not history:
+        # 首帧：没有历史，直接全发（包含 <think>）
+        return curr
+
+    # 1) 优先：history 在 curr 的最后一次出现（典型瀑布模式 curr = [旧段* + history + 新尾巴]）
+    idx = curr.rfind(history)
+    if idx != -1:
+        return curr[idx + len(history):]
+
+    # 2) 次优：history 的最长后缀在 curr 中的匹配
+    max_k = min(len(history), len(curr))
+    MIN_MATCH = 8  # 避免过短噪声匹配，可按需调整
+    for k in range(max_k, MIN_MATCH - 1, -1):
+        suf = history[-k:]
+        pos = curr.find(suf)
+        if pos != -1:
+            return curr[pos + k:]
+
+    # 3) 回退：LCP 与上一帧差分
+    delta = _lcp_delta(last, curr)
+
+    # 4) 若 delta 仍在历史中出现（说明这帧多半是旧段改写/插回），取新颖后缀
+    if delta and delta in history:
+        fresh = _novel_suffix(history, curr)
+        return fresh
+
+    return delta
 
 # ===================== FastAPI 生命周期 =====================
 
@@ -670,10 +710,10 @@ async def chat_completions(
                 session.close()
                 raise HTTPException(status_code=response.status_code, detail=f"Akash API error: {response.text}")
 
-            # ----------- 增量 + 重叠去重 + 新颖后缀（不移除 <think>） -----------
+            # ----------- 关键：按累计文本对齐的增量算法（保留 <think>） -----------
             def generate():
-                last_text = ""      # 上一帧的“累计文本”（包含 <think>）
-                sent_total = ""     # 已经实际发送给前端的总文本
+                last_text = ""      # 上一帧的累计文本（包含 <think>）
+                sent_total = ""     # 已实际发送给前端的总文本
                 sent_role = False
                 image_job_done = False
 
@@ -710,21 +750,9 @@ async def chat_completions(
                                             yield f"data: {json.dumps(m, ensure_ascii=False)}\n\n"
                                     continue
 
-                                # ==== compute emit begin ====
-                                # LCP：把“累计”变“候选增量”
-                                candidate = _lcp_delta(last_text, msg_data)
+                                # ==== compute emit begin (使用累计对齐法) ====
+                                emit = _emit_from_cumulative(sent_total, msg_data, last_text)
                                 last_text = msg_data
-                                if not candidate:
-                                    continue
-
-                                # 边界粘连去重
-                                overlap = _suffix_prefix_overlap(sent_total, candidate)
-                                emit = candidate[overlap:]
-
-                                # 若仍为“历史已出现过”的内容（说明上游夹带旧段落），使用新颖后缀
-                                if emit and emit in sent_total:
-                                    emit = _novel_suffix(sent_total, candidate)
-
                                 if not emit:
                                     continue
                                 # ==== compute emit end ====
