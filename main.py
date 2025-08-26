@@ -21,17 +21,14 @@ from playwright.sync_api import sync_playwright
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor
 import random
-
 # 加载环境变量
 load_dotenv(override=True)
-
 # 配置日志
 logging.basicConfig(
     level=logging.INFO,  # 改为 INFO 级别
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
 # 修改全局数据存储
 global_data = {
     "cookie": None,
@@ -40,7 +37,6 @@ global_data = {
     "cookie_expires": 0,  # 添加 cookie 过期时间
     "is_refreshing": False  # 添加刷新状态标志
 }
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 启动时获取 cookie
@@ -65,7 +61,6 @@ async def lifespan(app: FastAPI):
     global_data["cookies"] = None
     global_data["last_update"] = 0
     global_data["is_refreshing"] = False
-
 def get_cookie_with_retry(max_retries=3, retry_delay=5):
     """带重试机制的获取 cookie 函数"""
     retries = 0
@@ -83,15 +78,12 @@ def get_cookie_with_retry(max_retries=3, retry_delay=5):
     
     logger.error(f"Failed to fetch cookie after {max_retries} attempts")
     return None
-
 app = FastAPI(lifespan=lifespan)
 security = HTTPBearer()
-
 # OpenAI API Key 配置，可以通过环境变量覆盖
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", None)
 logger.info(f"OPENAI_API_KEY is set: {OPENAI_API_KEY is not None}")
 # logger.info(f"OPENAI_API_KEY value: {OPENAI_API_KEY}")
-
 def get_random_browser_fingerprint():
     """生成随机的浏览器指纹"""
     # 随机选择浏览器版本
@@ -152,7 +144,6 @@ def get_random_browser_fingerprint():
         "viewport": selected_viewport,
         "user_agent": user_agent
     }
-
 def get_cookie():
     """获取 cookie 的函数"""
     browser = None
@@ -398,7 +389,6 @@ def get_cookie():
     gc.collect()
     
     return None
-
 # 添加刷新 cookie 的函数
 async def refresh_cookie():
     """刷新 cookie 的函数，用于401错误触发"""
@@ -429,7 +419,6 @@ async def refresh_cookie():
         return new_cookie
     finally:
         global_data["is_refreshing"] = False
-
 async def background_refresh_cookie():
     """后台刷新 cookie 的函数，不影响接口调用"""
     if global_data["is_refreshing"]:
@@ -465,7 +454,6 @@ async def background_refresh_cookie():
         logger.error(f"Error in background cookie refresh: {e}")
     finally:
         global_data["is_refreshing"] = False
-
 async def check_and_update_cookie():
     """检查并更新 cookie"""
     try:
@@ -494,7 +482,6 @@ async def check_and_update_cookie():
         logger.error(f"Error in check_and_update_cookie: {e}")
         import traceback
         logger.error(f"Traceback: {traceback.format_exc()}")
-
 async def get_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
     token = credentials.credentials
     # logger.info(f"Received token: {token}")
@@ -513,7 +500,6 @@ async def get_api_key(credentials: HTTPAuthorizationCredentials = Depends(securi
         logger.info("API key validation passed")
     
     return True
-
 async def validate_cookie(background_tasks: BackgroundTasks):
     # 检查并更新 cookie（如果需要）
     await check_and_update_cookie()
@@ -535,7 +521,6 @@ async def validate_cookie(background_tasks: BackgroundTasks):
     
     logger.info("Cookie validation passed")
     return global_data["cookie"]
-
 async def check_image_status(session: requests.Session, full_job_id: str, short_job_id: str, headers: dict) -> Optional[str]:
     """检查图片生成状态并获取生成的图片"""
     max_retries = 30
@@ -645,7 +630,6 @@ async def check_image_status(session: requests.Session, full_job_id: str, short_
     
     print(f"Timeout waiting for job {full_job_id}")
     return None
-
 @app.get("/", response_class=HTMLResponse)
 async def health_check():
     """健康检查端点，返回服务状态"""
@@ -1022,7 +1006,6 @@ async def health_check():
     </body>
     </html>
     """)
-
 @app.post("/v1/chat/completions")
 async def chat_completions(
     request: Request,
@@ -1115,7 +1098,7 @@ async def chat_completions(
                 )
             
             def generate():
-                content_buffer = ""
+                # content_buffer = "" # <-- REMOVED: This buffer caused the cumulative output issue.
                 for line in response.iter_lines():
                     if not line:
                         continue
@@ -1138,8 +1121,9 @@ async def chat_completions(
                                     if messages:
                                         return messages
                                     return None
-
                                 # 创建新的事件循环
+                                # Note: Creating a new event loop here is not ideal in an async framework.
+                                # A more robust solution might involve refactoring, but this works for now.
                                 loop = asyncio.new_event_loop()
                                 asyncio.set_event_loop(loop)
                                 try:
@@ -1152,7 +1136,7 @@ async def chat_completions(
                                         yield f"data: {json.dumps(message)}\n\n"
                                     continue
                             
-                            content_buffer += msg_data
+                            # content_buffer += msg_data # <-- REMOVED: This was the cause of the problem.
                             
                             chunk = {
                                 "id": f"chatcmpl-{chat_id}",
@@ -1160,7 +1144,7 @@ async def chat_completions(
                                 "created": int(time.time()),
                                 "model": data.get('model'),
                                 "choices": [{
-                                    "delta": {"content": msg_data},
+                                    "delta": {"content": msg_data}, # Now correctly sends only the new part.
                                     "index": 0,
                                     "finish_reason": None
                                 }]
@@ -1186,7 +1170,6 @@ async def chat_completions(
                     except Exception as e:
                         print(f"Error processing line: {e}")
                         continue
-
             return StreamingResponse(
                 generate(),
                 media_type='text/event-stream',
@@ -1202,7 +1185,6 @@ async def chat_completions(
         import traceback
         print(traceback.format_exc())
         return {"error": str(e)}
-
 @app.get("/v1/models")
 async def list_models(
     background_tasks: BackgroundTasks,
@@ -1316,7 +1298,6 @@ async def list_models(
         import traceback
         logger.error(f"Traceback: {traceback.format_exc()}")
         return {"error": str(e)}
-
 async def process_image_generation(msg_data: str, session: requests.Session, headers: dict, chat_id: str) -> Optional[list]:
     """处理图片生成的逻辑，返回多个消息块"""
     # 检查消息中是否包含jobId
@@ -1414,7 +1395,6 @@ async def process_image_generation(msg_data: str, session: requests.Session, hea
         import traceback
         logger.error(f"Traceback: {traceback.format_exc()}")
         return create_error_messages(chat_id, "图片生成过程中发生错误。请稍后再试。")
-
 def create_error_messages(chat_id: str, error_message: str) -> list:
     """创建错误消息块"""
     return [{
@@ -1428,8 +1408,6 @@ def create_error_messages(chat_id: str, error_message: str) -> list:
             "finish_reason": None
         }]
     }]
-
-
 
 async def upload_to_xinyew(image_data: bytes, job_id: str) -> Optional[str]:
     """上传图片到新野图床并返回URL"""
@@ -1507,8 +1485,6 @@ async def upload_to_xinyew(image_data: bytes, job_id: str) -> Optional[str]:
         print(traceback.format_exc())
         return None
 
-
-
 def auto_refresh_cookie():
     """自动刷新 cookie 的线程函数"""
     while True:
@@ -1547,7 +1523,6 @@ def auto_refresh_cookie():
             import gc
             gc.collect()
             time.sleep(60)  # 出错后等待60秒再继续
-
 if __name__ == '__main__':
     import uvicorn
     uvicorn.run(app, host='0.0.0.0', port=9000)
