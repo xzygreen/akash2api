@@ -70,6 +70,20 @@ def _suffix_prefix_overlap(a: str, b: str) -> int:
             return k
     return 0
 
+
+def _novel_suffix(history: str, piece: str) -> str:
+    """
+    从 piece 中找出“在历史 history 中从未出现过”的最短后缀。
+    若 piece 的所有后缀都已出现过，则返回空串（不必再发）。
+    复杂度 O(n^2)；对对话长度足够，必要时可换 KMP/后缀数组优化。
+    """
+    n = len(piece)
+    for i in range(n):
+        cand = piece[i:]
+        if cand and cand not in history:
+            return cand
+    return ""
+
 # ===================== FastAPI 生命周期 =====================
 
 @asynccontextmanager
@@ -656,9 +670,9 @@ async def chat_completions(
                 session.close()
                 raise HTTPException(status_code=response.status_code, detail=f"Akash API error: {response.text}")
 
-            # ----------- 关键：增量 + 重叠去重，且不移除 <think> -----------
+            # ----------- 增量 + 重叠去重 + 新颖后缀（不移除 <think>） -----------
             def generate():
-                last_text = ""      # 上一帧的累计文本（原样，包含 <think>）
+                last_text = ""      # 上一帧的“累计文本”（包含 <think>）
                 sent_total = ""     # 已经实际发送给前端的总文本
                 sent_role = False
                 image_job_done = False
@@ -696,17 +710,24 @@ async def chat_completions(
                                             yield f"data: {json.dumps(m, ensure_ascii=False)}\n\n"
                                     continue
 
-                                # LCP：把累计变增量候选
+                                # ==== compute emit begin ====
+                                # LCP：把“累计”变“候选增量”
                                 candidate = _lcp_delta(last_text, msg_data)
                                 last_text = msg_data
                                 if not candidate:
                                     continue
 
-                                # 尾首重叠去重：杜绝任何重复
+                                # 边界粘连去重
                                 overlap = _suffix_prefix_overlap(sent_total, candidate)
                                 emit = candidate[overlap:]
+
+                                # 若仍为“历史已出现过”的内容（说明上游夹带旧段落），使用新颖后缀
+                                if emit and emit in sent_total:
+                                    emit = _novel_suffix(sent_total, candidate)
+
                                 if not emit:
                                     continue
+                                # ==== compute emit end ====
 
                                 if not sent_role:
                                     role_chunk = {
