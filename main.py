@@ -1225,7 +1225,7 @@ async def chat_completions(
                                     continue  # 跳过空增量
 
                                 # 可选：隐藏思考（如需保留，可注释这一行）
-                                new_text = _strip_think(new_text)
+                                #new_text = _strip_think(new_text)
                                 if not new_text:
                                     continue
 
