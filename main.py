@@ -21,14 +21,17 @@ from playwright.sync_api import sync_playwright
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor
 import random
+
 # 加载环境变量
 load_dotenv(override=True)
+
 # 配置日志
 logging.basicConfig(
     level=logging.INFO,  # 改为 INFO 级别
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
 # 修改全局数据存储
 global_data = {
     "cookie": None,
@@ -37,6 +40,7 @@ global_data = {
     "cookie_expires": 0,  # 添加 cookie 过期时间
     "is_refreshing": False  # 添加刷新状态标志
 }
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 启动时获取 cookie
@@ -61,6 +65,7 @@ async def lifespan(app: FastAPI):
     global_data["cookies"] = None
     global_data["last_update"] = 0
     global_data["is_refreshing"] = False
+
 def get_cookie_with_retry(max_retries=3, retry_delay=5):
     """带重试机制的获取 cookie 函数"""
     retries = 0
@@ -78,12 +83,15 @@ def get_cookie_with_retry(max_retries=3, retry_delay=5):
     
     logger.error(f"Failed to fetch cookie after {max_retries} attempts")
     return None
+
 app = FastAPI(lifespan=lifespan)
 security = HTTPBearer()
+
 # OpenAI API Key 配置，可以通过环境变量覆盖
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", None)
 logger.info(f"OPENAI_API_KEY is set: {OPENAI_API_KEY is not None}")
 # logger.info(f"OPENAI_API_KEY value: {OPENAI_API_KEY}")
+
 def get_random_browser_fingerprint():
     """生成随机的浏览器指纹"""
     # 随机选择浏览器版本
@@ -144,6 +152,7 @@ def get_random_browser_fingerprint():
         "viewport": selected_viewport,
         "user_agent": user_agent
     }
+
 def get_cookie():
     """获取 cookie 的函数"""
     browser = None
@@ -389,6 +398,7 @@ def get_cookie():
     gc.collect()
     
     return None
+
 # 添加刷新 cookie 的函数
 async def refresh_cookie():
     """刷新 cookie 的函数，用于401错误触发"""
@@ -419,6 +429,7 @@ async def refresh_cookie():
         return new_cookie
     finally:
         global_data["is_refreshing"] = False
+
 async def background_refresh_cookie():
     """后台刷新 cookie 的函数，不影响接口调用"""
     if global_data["is_refreshing"]:
@@ -454,6 +465,7 @@ async def background_refresh_cookie():
         logger.error(f"Error in background cookie refresh: {e}")
     finally:
         global_data["is_refreshing"] = False
+
 async def check_and_update_cookie():
     """检查并更新 cookie"""
     try:
@@ -482,6 +494,7 @@ async def check_and_update_cookie():
         logger.error(f"Error in check_and_update_cookie: {e}")
         import traceback
         logger.error(f"Traceback: {traceback.format_exc()}")
+
 async def get_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
     token = credentials.credentials
     # logger.info(f"Received token: {token}")
@@ -500,6 +513,7 @@ async def get_api_key(credentials: HTTPAuthorizationCredentials = Depends(securi
         logger.info("API key validation passed")
     
     return True
+
 async def validate_cookie(background_tasks: BackgroundTasks):
     # 检查并更新 cookie（如果需要）
     await check_and_update_cookie()
@@ -521,6 +535,7 @@ async def validate_cookie(background_tasks: BackgroundTasks):
     
     logger.info("Cookie validation passed")
     return global_data["cookie"]
+
 async def check_image_status(session: requests.Session, full_job_id: str, short_job_id: str, headers: dict) -> Optional[str]:
     """检查图片生成状态并获取生成的图片"""
     max_retries = 30
@@ -630,6 +645,7 @@ async def check_image_status(session: requests.Session, full_job_id: str, short_
     
     print(f"Timeout waiting for job {full_job_id}")
     return None
+
 @app.get("/", response_class=HTMLResponse)
 async def health_check():
     """健康检查端点，返回服务状态"""
@@ -1006,6 +1022,7 @@ async def health_check():
     </body>
     </html>
     """)
+
 @app.post("/v1/chat/completions")
 async def chat_completions(
     request: Request,
@@ -1016,9 +1033,16 @@ async def chat_completions(
     try:
         data = await request.json()
         
+        # 获取随机浏览器指纹
         fingerprint = get_random_browser_fingerprint()
+        logger.info(f"Using browser fingerprint: {fingerprint['user_agent']}")
+        
         chat_id = str(uuid.uuid4()).replace('-', '')[:16]
         
+        # 确保系统消息正确处理
+        system_message = data.get('system_message') or data.get('system', "You are a helpful assistant.")
+        
+        # 处理messages格式，确保与官网格式一致
         processed_messages = []
         for msg in data.get('messages', []):
             processed_msg = {
@@ -1028,123 +1052,156 @@ async def chat_completions(
             }
             processed_messages.append(processed_msg)
         
+        # 更新请求数据格式，与实际 Akash API 请求保持一致
         akash_data = {
             "id": chat_id,
             "messages": processed_messages,
             "model": data.get('model', "DeepSeek-R1"),
-            "system": data.get('system_message') or data.get('system', "You are a helpful assistant."),
+            "system": system_message,
             "temperature": data.get('temperature', 0.85 if data.get('model') == 'AkashGen' else 0.6),
             "topP": data.get('top_p', 1.0 if data.get('model') == 'AkashGen' else 0.95),
-            "context": []
+            "context": []  # 添加 context 字段
         }
         
+        # 记录当前使用的 cookie（部分隐藏）
+        cookie_start = cookie[:20]
+        cookie_end = cookie[-20:] if len(cookie) > 40 else ""
+        logger.info(f"Using cookie: {cookie_start}...{cookie_end}")
+        
         with requests.Session() as session:
+            # 设置 Cookie 使用请求头方式
             session.headers.update(fingerprint["headers"])
-            cookies_dict = {name: value for name, value in (item.strip().split('=', 1) for item in cookie.split(';') if '=' in item)}
+            cookies_dict = {}
             
-            response = session.post('https://chat.akash.network/api/chat', json=akash_data, cookies=cookies_dict, stream=True)
+            # 解析 cookie 字符串到字典
+            for cookie_item in cookie.split(';'):
+                if '=' in cookie_item:
+                    name, value = cookie_item.strip().split('=', 1)
+                    cookies_dict[name] = value
             
+            # 使用 cookies 参数而不是 headers['Cookie']
+            response = session.post(
+                'https://chat.akash.network/api/chat',
+                json=akash_data,
+                cookies=cookies_dict,
+                stream=True
+            )
+            
+            # 检查响应状态码，如果是 401 或 403，尝试刷新 cookie 并重试
             if response.status_code in [401, 403]:
                 logger.info(f"Authentication failed with status {response.status_code}, refreshing cookie...")
                 new_cookie = await refresh_cookie()
                 if new_cookie:
                     logger.info("Successfully refreshed cookie, retrying request")
-                    new_cookies_dict = {name: value for name, value in (item.strip().split('=', 1) for item in new_cookie.split(';') if '=' in item)}
-                    response = session.post('https://chat.akash.network/api/chat', json=akash_data, cookies=new_cookies_dict, stream=True)
+                    # 解析新 cookie 字符串到字典
+                    new_cookies_dict = {}
+                    for cookie_item in new_cookie.split(';'):
+                        if '=' in cookie_item:
+                            name, value = cookie_item.strip().split('=', 1)
+                            new_cookies_dict[name] = value
+                    
+                    response = session.post(
+                        'https://chat.akash.network/api/chat',
+                        json=akash_data,
+                        cookies=new_cookies_dict,
+                        stream=True
+                    )
             
             if response.status_code not in [200, 201]:
                 logger.error(f"Akash API error: Status {response.status_code}, Response: {response.text}")
-                raise HTTPException(status_code=response.status_code, detail=f"Akash API error: {response.text}")
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail=f"Akash API error: {response.text}"
+                )
             
             def generate():
-                # =================== 最终完美版逻辑 START ===================
-                last_content = ""
-                # 状态标志：False=累积流模式, True=片段流模式(在think块后触发)
-                is_fragment_mode = False
-
+                content_buffer = ""
                 for line in response.iter_lines():
                     if not line:
                         continue
+                        
                     try:
                         line_str = line.decode('utf-8')
-                        if ':' not in line_str:
-                            continue
-                            
                         msg_type, msg_data = line_str.split(':', 1)
                         
                         if msg_type == '0':
-                            try:
-                                content = json.loads(msg_data)
-                            except json.JSONDecodeError:
-                                content = msg_data[1:-1] if msg_data.startswith('"') and msg_data.endswith('"') else msg_data
+                            if msg_data.startswith('"') and msg_data.endswith('"'):
+                                msg_data = msg_data.replace('\\"', '"')
+                                msg_data = msg_data[1:-1]
+                            msg_data = msg_data.replace("\\n", "\n")
                             
-                            content = content.replace("\\n", "\n")
-
-                            # 检查是否是特殊的<image_generation>块
-                            if data.get('model') == 'AkashGen' and "<image_generation>" in content:
+                            # 在处理消息时先判断模型类型
+                            if data.get('model') == 'AkashGen' and "<image_generation>" in msg_data:
                                 # 图片生成模型的特殊处理
+                                async def process_and_send():
+                                    messages = await process_image_generation(msg_data, session, fingerprint["headers"], chat_id)
+                                    if messages:
+                                        return messages
+                                    return None
+
+                                # 创建新的事件循环
                                 loop = asyncio.new_event_loop()
                                 asyncio.set_event_loop(loop)
                                 try:
-                                    result_messages = loop.run_until_complete(
-                                        process_image_generation(content, session, fingerprint["headers"], chat_id)
-                                    )
+                                    result_messages = loop.run_until_complete(process_and_send())
                                 finally:
                                     loop.close()
                                 
                                 if result_messages:
                                     for message in result_messages:
                                         yield f"data: {json.dumps(message)}\n\n"
-                                continue
-
-                            delta_to_send = ""
-
-                            # 检查是否是<think>块，这是模式切换的信号
-                            if "<think>" in content and "</think>" in content and not is_fragment_mode:
-                                delta_to_send = content
-                                is_fragment_mode = True # 切换到片段流模式
-                            elif is_fragment_mode:
-                                # 进入片段模式后，所有内容都直接是delta
-                                delta_to_send = content
-                            else:
-                                # 默认处理累积流模式
-                                if len(content) > len(last_content) and content.startswith(last_content):
-                                    delta_to_send = content[len(last_content):]
-                                    last_content = content
-                                # 处理流重置的情况
-                                elif not content.startswith(last_content) or len(content) < len(last_content):
-                                    delta_to_send = content
-                                    last_content = content
-                                else:
-                                    delta_to_send = ""
-
-                            if delta_to_send:
-                                chunk = {
-                                    "id": f"chatcmpl-{chat_id}", "object": "chat.completion.chunk",
-                                    "created": int(time.time()), "model": data.get('model'),
-                                    "choices": [{"delta": {"content": delta_to_send}, "index": 0, "finish_reason": None}]
-                                }
-                                yield f"data: {json.dumps(chunk)}\n\n"
+                                    continue
+                            
+                            content_buffer += msg_data
+                            
+                            chunk = {
+                                "id": f"chatcmpl-{chat_id}",
+                                "object": "chat.completion.chunk",
+                                "created": int(time.time()),
+                                "model": data.get('model'),
+                                "choices": [{
+                                    "delta": {"content": msg_data},
+                                    "index": 0,
+                                    "finish_reason": None
+                                }]
+                            }
+                            yield f"data: {json.dumps(chunk)}\n\n"
                         
                         elif msg_type in ['e', 'd']:
                             chunk = {
-                                "id": f"chatcmpl-{chat_id}", "object": "chat.completion.chunk",
-                                "created": int(time.time()), "model": data.get('model'),
-                                "choices": [{"delta": {}, "index": 0, "finish_reason": "stop"}]
+                                "id": f"chatcmpl-{chat_id}",
+                                "object": "chat.completion.chunk",
+                                "created": int(time.time()),
+                                "model": data.get('model'),
+                                "choices": [{
+                                    "delta": {},
+                                    "index": 0,
+                                    "finish_reason": "stop"
+                                }]
                             }
                             yield f"data: {json.dumps(chunk)}\n\n"
                             yield "data: [DONE]\n\n"
                             break
+                            
                     except Exception as e:
-                        logger.error(f"Stream processing error: {e} on line: {line_str}", exc_info=True)
+                        print(f"Error processing line: {e}")
                         continue
-                # =================== 最终完美版逻辑 END ===================
 
-            return StreamingResponse(generate(), media_type='text/event-stream', headers={'Cache-Control': 'no-cache', 'Connection': 'keep-alive'})
+            return StreamingResponse(
+                generate(),
+                media_type='text/event-stream',
+                headers={
+                    'Cache-Control': 'no-cache',
+                    'Connection': 'keep-alive',
+                    'Content-Type': 'text/event-stream'
+                }
+            )
     
     except Exception as e:
-        logger.error(f"Error in chat_completions: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Error in chat_completions: {e}")
+        import traceback
+        print(traceback.format_exc())
+        return {"error": str(e)}
 
 @app.get("/v1/models")
 async def list_models(
@@ -1152,27 +1209,80 @@ async def list_models(
     cookie: str = Depends(validate_cookie)
 ):
     try:
+        # 获取随机浏览器指纹
         fingerprint = get_random_browser_fingerprint()
+        logger.info(f"Using browser fingerprint: {fingerprint['user_agent']}")
+        
+        # 构建更符合实际请求的请求头
         headers = fingerprint["headers"]
         
+        # 记录当前使用的 cookie（部分隐藏）
+        cookie_start = cookie[:20]
+        cookie_end = cookie[-20:] if len(cookie) > 40 else ""
+        logger.info(f"Using cookie: {cookie_start}...{cookie_end}")
+        logger.info("Sending request to get models...")
+        
         with requests.Session() as session:
+            # 设置会话的默认请求头
             session.headers.update(headers)
-            cookies_dict = {name: value for name, value in (item.strip().split('=', 1) for item in cookie.split(';') if '=' in item)}
             
-            response = session.get('https://chat.akash.network/api/models', cookies=cookies_dict)
-
+            # 解析 cookie 字符串到字典
+            cookies_dict = {}
+            for cookie_item in cookie.split(';'):
+                if '=' in cookie_item:
+                    name, value = cookie_item.strip().split('=', 1)
+                    cookies_dict[name] = value
+            
+            response = session.get(
+                'https://chat.akash.network/api/models',
+                cookies=cookies_dict
+            )
+            
+            logger.info(f"Models response status: {response.status_code}")
+        
+            # 检查响应状态码，如果是 401 或 403，尝试刷新 cookie 并重试
             if response.status_code in [401, 403]:
+                logger.info(f"Authentication failed with status {response.status_code}, refreshing cookie...")
                 new_cookie = await refresh_cookie()
                 if new_cookie:
-                    new_cookies_dict = {name: value for name, value in (item.strip().split('=', 1) for item in new_cookie.split(';') if '=' in item)}
-                    response = session.get('https://chat.akash.network/api/models', cookies=new_cookies_dict)
+                    logger.info("Successfully refreshed cookie, retrying request")
+                    
+                    # 解析新 cookie 字符串到字典
+                    new_cookies_dict = {}
+                    for cookie_item in new_cookie.split(';'):
+                        if '=' in cookie_item:
+                            name, value = cookie_item.strip().split('=', 1)
+                            new_cookies_dict[name] = value
+                    
+                    response = session.get(
+                        'https://chat.akash.network/api/models',
+                        cookies=new_cookies_dict
+                    )
         
             if response.status_code not in [200, 201]:
-                raise HTTPException(status_code=response.status_code, detail="Failed to fetch models.")
+                logger.error(f"Akash API error: Status {response.status_code}, Response: {response.text}")
+                return {"error": f"Authentication failed. Status: {response.status_code}"}
         
-            akash_response = response.json()
-            models_list = akash_response if isinstance(akash_response, list) else akash_response.get("models", [])
+            try:
+                akash_response = response.json()
+                logger.info(f"Received models data of type: {type(akash_response)}")
+            except ValueError:
+                logger.error(f"Invalid JSON response: {response.text[:100]}...")
+                return {"error": "Invalid response format"}
             
+            # 检查响应格式并适配
+            models_list = []
+            if isinstance(akash_response, list):
+                # 如果直接是列表
+                models_list = akash_response
+            elif isinstance(akash_response, dict):
+                # 如果是字典格式
+                models_list = akash_response.get("models", [])
+            else:
+                logger.error(f"Unexpected response format: {type(akash_response)}")
+                models_list = []
+            
+            # 转换为标准 OpenAI 格式
             openai_models = {
                 "object": "list",
                 "data": [
@@ -1180,15 +1290,32 @@ async def list_models(
                         "id": model["id"] if isinstance(model, dict) else model,
                         "object": "model",
                         "created": int(time.time()),
-                        "owned_by": "akash"
+                        "owned_by": "akash",
+                        "permission": [{
+                            "id": f"modelperm-{model['id'] if isinstance(model, dict) else model}",
+                            "object": "model_permission",
+                            "created": int(time.time()),
+                            "allow_create_engine": False,
+                            "allow_sampling": True,
+                            "allow_logprobs": True,
+                            "allow_search_indices": False,
+                            "allow_view": True,
+                            "allow_fine_tuning": False,
+                            "organization": "*",
+                            "group": None,
+                            "is_blocking": False
+                        }]
                     } for model in models_list
                 ]
             }
+            
             return openai_models
             
     except Exception as e:
-        logger.error(f"Error in list_models: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Error in list_models: {e}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return {"error": str(e)}
 
 async def process_image_generation(msg_data: str, session: requests.Session, headers: dict, chat_id: str) -> Optional[list]:
     """处理图片生成的逻辑，返回多个消息块"""
@@ -1287,6 +1414,7 @@ async def process_image_generation(msg_data: str, session: requests.Session, hea
         import traceback
         logger.error(f"Traceback: {traceback.format_exc()}")
         return create_error_messages(chat_id, "图片生成过程中发生错误。请稍后再试。")
+
 def create_error_messages(chat_id: str, error_message: str) -> list:
     """创建错误消息块"""
     return [{
@@ -1300,6 +1428,8 @@ def create_error_messages(chat_id: str, error_message: str) -> list:
             "finish_reason": None
         }]
     }]
+
+
 
 async def upload_to_xinyew(image_data: bytes, job_id: str) -> Optional[str]:
     """上传图片到新野图床并返回URL"""
@@ -1377,6 +1507,8 @@ async def upload_to_xinyew(image_data: bytes, job_id: str) -> Optional[str]:
         print(traceback.format_exc())
         return None
 
+
+
 def auto_refresh_cookie():
     """自动刷新 cookie 的线程函数"""
     while True:
@@ -1415,6 +1547,7 @@ def auto_refresh_cookie():
             import gc
             gc.collect()
             time.sleep(60)  # 出错后等待60秒再继续
+
 if __name__ == '__main__':
     import uvicorn
     uvicorn.run(app, host='0.0.0.0', port=9000)
