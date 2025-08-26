@@ -1079,10 +1079,27 @@ async def chat_completions(
                                 content = msg_data[1:-1] if msg_data.startswith('"') and msg_data.endswith('"') else msg_data
                             
                             content = content.replace("\\n", "\n")
-                            
+
+                            # 检查是否是特殊的<image_generation>块
+                            if data.get('model') == 'AkashGen' and "<image_generation>" in content:
+                                # 图片生成模型的特殊处理
+                                loop = asyncio.new_event_loop()
+                                asyncio.set_event_loop(loop)
+                                try:
+                                    result_messages = loop.run_until_complete(
+                                        process_image_generation(content, session, fingerprint["headers"], chat_id)
+                                    )
+                                finally:
+                                    loop.close()
+                                
+                                if result_messages:
+                                    for message in result_messages:
+                                        yield f"data: {json.dumps(message)}\n\n"
+                                continue
+
                             delta_to_send = ""
 
-                            # 检查是否是特殊的<think>块，这是模式切换的信号
+                            # 检查是否是<think>块，这是模式切换的信号
                             if "<think>" in content and "</think>" in content and not is_fragment_mode:
                                 delta_to_send = content
                                 is_fragment_mode = True # 切换到片段流模式
@@ -1094,11 +1111,10 @@ async def chat_completions(
                                 if len(content) > len(last_content) and content.startswith(last_content):
                                     delta_to_send = content[len(last_content):]
                                     last_content = content
-                                # 处理流重置的情况，例如从一个累积块跳到另一个
+                                # 处理流重置的情况
                                 elif not content.startswith(last_content) or len(content) < len(last_content):
                                     delta_to_send = content
                                     last_content = content
-                                # 如果内容完全相同，则忽略
                                 else:
                                     delta_to_send = ""
 
@@ -1175,67 +1191,230 @@ async def list_models(
         raise HTTPException(status_code=500, detail=str(e))
 
 async def process_image_generation(msg_data: str, session: requests.Session, headers: dict, chat_id: str) -> Optional[list]:
-    match = re.search(r"jobId='([^']+)' prompt='([^']+)'", msg_data)
-    if not match: return create_error_messages(chat_id, "无法解析图片任务。")
+    """处理图片生成的逻辑，返回多个消息块"""
+    # 检查消息中是否包含jobId
+    if "jobId='undefined'" in msg_data or "jobId=''" in msg_data:
+        logger.error("Image generation failed: jobId is undefined or empty")
+        return create_error_messages(chat_id, "Akash官网服务异常，无法生成图片,请稍后再试。")
+        
+    match = re.search(r"jobId='([^']+)' prompt='([^']+)' negative='([^']*)'", msg_data)
+    if not match:
+        logger.error(f"Failed to extract job_id from message: {msg_data[:100]}...")
+        return create_error_messages(chat_id, "无法解析图片生成任务。请稍后再试。")
+        
+    job_id, prompt, negative = match.groups()
     
-    job_id = match.group(1)
-    if not job_id or job_id in ['undefined', 'null']:
-        return create_error_messages(chat_id, "无法获取有效的任务ID。")
+    # 检查job_id是否有效
+    if not job_id or job_id == 'undefined' or job_id == 'null':
+        logger.error(f"Invalid job_id: {job_id}")
+        return create_error_messages(chat_id, "Akash服务异常，无法获取有效的任务ID。请稍后再试。")
     
-    short_job_id = job_id.replace('-', '')[:8]
-    result = await check_image_status(session, job_id, short_job_id, headers)
+    print(f"Starting image generation process for job_id: {job_id}")
+    print(f"Job ID format check - Length: {len(job_id)}, Contains hyphens: {'-' in job_id}")
     
-    if result:
-        image_msg = f"\n\n![Generated Image]({result})"
-        return [{"id": f"chatcmpl-{chat_id}-image", "object": "chat.completion.chunk", "created": int(time.time()), "model": "AkashGen", "choices": [{"delta": {"content": image_msg}, "index": 0, "finish_reason": None}]}]
-    else:
-        return create_error_messages(chat_id, "图片生成或上传失败。")
-
+    # 确保job_id是完整的UUID格式（用于状态查询）
+    full_job_id = job_id
+    # 从job_id中提取短格式（用于构建图片URL）
+    short_job_id = job_id.replace('-', '')[:8] if '-' in job_id else job_id[:8]
+    print(f"Full job ID for status: {full_job_id}")
+    print(f"Short job ID for image URL: {short_job_id}")
+    
+    # 记录开始时间
+    start_time = time.time()
+    
+    # 发送思考开始的消息
+    think_msg = "<think>\n"
+    think_msg += "🎨 Generating image...\n\n"
+    think_msg += f"Prompt: {prompt}\n"
+    
+    try:
+        # 检查图片状态和上传
+        result = await check_image_status(session, full_job_id, short_job_id, headers)
+        
+        # 计算实际花费的时间
+        elapsed_time = time.time() - start_time
+        
+        # 完成思考部分
+        think_msg += f"\n🤔 Thinking for {elapsed_time:.1f}s...\n"
+        think_msg += "</think>"
+        
+        # 返回两个独立的消息块
+        messages = []
+        
+        # 第一个消息块：思考过程
+        messages.append({
+            "id": f"chatcmpl-{chat_id}-think",
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": "AkashGen",
+            "choices": [{
+                "delta": {"content": think_msg},
+                "index": 0,
+                "finish_reason": None
+            }]
+        })
+        
+        # 第二个消息块：图片结果
+        if result:
+            image_msg = f"\n\n![Generated Image]({result})"
+            messages.append({
+                "id": f"chatcmpl-{chat_id}-image",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": "AkashGen",
+                "choices": [{
+                    "delta": {"content": image_msg},
+                    "index": 0,
+                    "finish_reason": None
+                }]
+            })
+        else:
+            fail_msg = "\n\n*Image generation or upload failed.*"
+            messages.append({
+                "id": f"chatcmpl-{chat_id}-fail",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": "AkashGen",
+                "choices": [{
+                    "delta": {"content": fail_msg},
+                    "index": 0,
+                    "finish_reason": None
+                }]
+            })  
+        return messages
+    except Exception as e:
+        logger.error(f"Error in image generation process: {e}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return create_error_messages(chat_id, "图片生成过程中发生错误。请稍后再试。")
 def create_error_messages(chat_id: str, error_message: str) -> list:
-    return [{"id": f"chatcmpl-{chat_id}-error", "object": "chat.completion.chunk", "created": int(time.time()), "model": "AkashGen", "choices": [{"delta": {"content": f"\n\n**❌ {error_message}**"}, "index": 0, "finish_reason": None}]}]
+    """创建错误消息块"""
+    return [{
+        "id": f"chatcmpl-{chat_id}-error",
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": "AkashGen",
+        "choices": [{
+            "delta": {"content": f"\n\n**❌ {error_message}**"},
+            "index": 0,
+            "finish_reason": None
+        }]
+    }]
 
 async def upload_to_xinyew(image_data: bytes, job_id: str) -> Optional[str]:
+    """上传图片到新野图床并返回URL"""
     try:
+        print(f"\n=== Starting image upload to xinyew for job {job_id} ===")
+        print(f"Image data length: {len(image_data)} bytes")
+        
+        # 创建临时文件
         with tempfile.NamedTemporaryFile(suffix='.webp', delete=False) as temp_file:
             temp_file.write(image_data)
             temp_file_path = temp_file.name
         
         try:
-            with open(temp_file_path, 'rb') as f:
-                files = {'file': (f"{job_id}.webp", f, 'image/webp')}
-                response = requests.post('https://api.xinyew.cn/api/jdtc', files=files, timeout=30)
+            filename = f"{job_id}.webp"
+            print(f"Using filename: {filename}")
+            
+            # 准备表单数据 - 根据API文档，参数名应该是 file
+            files = {
+                'file': (filename, open(temp_file_path, 'rb'), 'image/webp')
+            }
+            
+            # 构建请求头
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
+                'Accept': 'application/json, text/javascript, */*; q=0.01',
+                'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+                'Origin': 'https://api.xinyew.cn',
+                'Referer': 'https://api.xinyew.cn/',
+                'X-Requested-With': 'XMLHttpRequest'
+            }
+            
+            print("Sending request to xinyew API...")
+            response = requests.post(
+                'https://api.xinyew.cn/api/jdtc',  # 使用正确的API地址
+                files=files,
+                headers=headers,
+                timeout=30
+            )
+            
+            print(f"Upload response status: {response.status_code}")
+            print(f"Upload response content: {response.text}")
             
             if response.status_code == 200:
-                result = response.json()
-                if result.get('errno') == 0:
-                    return result.get('data', {}).get('url')
+                try:
+                    result = response.json()
+                    print(f"Parsed JSON result: {result}")
+                    
+                    # 根据API文档，成功时 errno=0，失败时 errno=1
+                    if result.get('errno') == 0 and result.get('data'):
+                        # 从响应中获取图片URL
+                        data = result.get('data', {})
+                        url = data.get('url')
+                        if url:
+                            print(f"Successfully got image URL: {url}")
+                            return url
+                        print("No URL in response data")
+                    else:
+                        print(f"Upload failed: {result.get('message', 'Unknown error')}")
+                except json.JSONDecodeError:
+                    print("Failed to parse JSON response")
+            else:
+                print(f"Upload failed with status {response.status_code}")
+            return None
+                
         finally:
-            os.unlink(temp_file_path)
+            # 清理临时文件
+            try:
+                os.unlink(temp_file_path)
+            except Exception as e:
+                print(f"Error removing temp file: {e}")
+            
     except Exception as e:
-        logger.error(f"Error in upload_to_xinyew: {e}")
-    return None
+        print(f"Error in upload_to_xinyew: {e}")
+        import traceback
+        print(traceback.format_exc())
+        return None
 
 def auto_refresh_cookie():
     """自动刷新 cookie 的线程函数"""
     while True:
         try:
             current_time = time.time()
-            if (not global_data["cookie"] or current_time >= global_data["cookie_expires"]) and not global_data["is_refreshing"]:
+            # 只在 cookie 不存在或已过期时刷新
+            if (not global_data["cookie"] or 
+                current_time >= global_data["cookie_expires"]) and not global_data["is_refreshing"]:
+                
                 logger.info(f"Cookie status check: exists={bool(global_data['cookie'])}, expires_in={global_data['cookie_expires'] - current_time if global_data['cookie_expires'] > 0 else 'expired'}")
                 logger.info("Cookie expired or not available, starting refresh")
+                
                 try:
                     global_data["is_refreshing"] = True
-                    get_cookie()
+                    new_cookie = get_cookie()
+                    if new_cookie:
+                        logger.info("Cookie refresh successful")
+                    else:
+                        logger.error("Cookie refresh failed, will retry later")
                 except Exception as e:
-                    logger.error(f"Error during scheduled cookie refresh: {e}", exc_info=True)
+                    logger.error(f"Error during cookie refresh: {e}")
+                    import traceback
+                    logger.error(f"Traceback: {traceback.format_exc()}")
                 finally:
                     global_data["is_refreshing"] = False
+                    # 强制执行垃圾回收，释放内存
+                    import gc
+                    gc.collect()
+            
+            # 每60秒检查一次
             time.sleep(60)
         except Exception as e:
-            logger.error(f"Error in auto-refresh thread: {e}", exc_info=True)
-            global_data["is_refreshing"] = False
-            time.sleep(60)
-
+            logger.error(f"Error in auto-refresh thread: {e}")
+            global_data["is_refreshing"] = False  # 确保出错时也重置标志
+            # 强制执行垃圾回收，释放内存
+            import gc
+            gc.collect()
+            time.sleep(60)  # 出错后等待60秒再继续
 if __name__ == '__main__':
     import uvicorn
     uvicorn.run(app, host='0.0.0.0', port=9000)
