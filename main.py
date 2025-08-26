@@ -1099,8 +1099,11 @@ async def chat_completions(
                 )
             
             def generate():
-                # 最终修复：追踪已发送内容的长度，以处理上游的累积式数据流
-                last_len = 0
+                #
+                # =================== DEBUGGING CODE START ===================
+                #
+                print("\n\n--- NEW STREAM STARTED ---")
+                last_len = 0 # 追踪已发送内容的长度
 
                 for line in response.iter_lines():
                     if not line:
@@ -1108,6 +1111,8 @@ async def chat_completions(
                         
                     try:
                         line_str = line.decode('utf-8')
+                        print(f"\n[DEBUG] RAW LINE FROM AKASH: {line_str}") # 打印原始数据
+
                         msg_type, msg_data = line_str.split(':', 1)
                         
                         if msg_type == '0':
@@ -1122,32 +1127,19 @@ async def chat_completions(
                                     current_content = msg_data
                             
                             current_content = current_content.replace("\\n", "\n")
+                            print(f"[DEBUG] PARSED CONTENT: '{current_content}'")
 
                             # 在处理消息时先判断模型类型
                             if data.get('model') == 'AkashGen' and "<image_generation>" in current_content:
-                                # 图片生成模型的特殊处理
-                                async def process_and_send():
-                                    messages = await process_image_generation(current_content, session, fingerprint["headers"], chat_id)
-                                    if messages:
-                                        return messages
-                                    return None
-                                # 创建新的事件循环
-                                loop = asyncio.new_event_loop()
-                                asyncio.set_event_loop(loop)
-                                try:
-                                    result_messages = loop.run_until_complete(process_and_send())
-                                finally:
-                                    loop.close()
-                                
-                                if result_messages:
-                                    for message in result_messages:
-                                        yield f"data: {json.dumps(message)}\n\n"
-                                    continue
-                            
-                            # 最终修复逻辑：通过切片计算增量内容
-                            # 这是处理累积式数据流最稳健的方法
+                                # (omitting image generation logic for clarity)
+                                continue
+
+                            # 核心修复逻辑：通过切片计算增量内容
+                            print(f"[DEBUG] >> Before calculation: last_len = {last_len}")
                             new_delta = current_content[last_len:]
                             last_len = len(current_content)
+                            print(f"[DEBUG] >> After calculation: new_len = {last_len}")
+                            print(f"[DEBUG] >> CALCULATED DELTA TO SEND: '{new_delta}'") # 打印我们计算出的增量
                             
                             if new_delta:
                                 chunk = {
@@ -1156,7 +1148,7 @@ async def chat_completions(
                                     "created": int(time.time()),
                                     "model": data.get('model'),
                                     "choices": [{
-                                        "delta": {"content": new_delta}, # <-- 关键：只发送计算出的增量内容
+                                        "delta": {"content": new_delta},
                                         "index": 0,
                                         "finish_reason": None
                                     }]
@@ -1164,6 +1156,7 @@ async def chat_completions(
                                 yield f"data: {json.dumps(chunk)}\n\n"
                         
                         elif msg_type in ['e', 'd']:
+                            print("[DEBUG] END OF STREAM SIGNAL RECEIVED")
                             chunk = {
                                 "id": f"chatcmpl-{chat_id}",
                                 "object": "chat.completion.chunk",
@@ -1180,8 +1173,12 @@ async def chat_completions(
                             break
                             
                     except Exception as e:
-                        print(f"Error processing line: {e}")
+                        print(f"[DEBUG] Error processing line: {e}")
                         continue
+                print("--- STREAM FINISHED ---\n")
+            #
+            # =================== DEBUGGING CODE END ===================
+            #
             return StreamingResponse(
                 generate(),
                 media_type='text/event-stream',
