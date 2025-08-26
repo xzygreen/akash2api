@@ -1038,93 +1038,93 @@ async def chat_completions(
             "context": []
         }
         
-        session = requests.Session()
-        session.headers.update(fingerprint["headers"])
-        cookies_dict = {name: value for name, value in (item.strip().split('=', 1) for item in cookie.split(';') if '=' in item)}
-        
-        response = session.post('https://chat.akash.network/api/chat', json=akash_data, cookies=cookies_dict, stream=True)
-        
-        if response.status_code in [401, 403]:
-            logger.info(f"Authentication failed with status {response.status_code}, refreshing cookie...")
-            new_cookie = await refresh_cookie()
-            if new_cookie:
-                logger.info("Successfully refreshed cookie, retrying request")
-                new_cookies_dict = {name: value for name, value in (item.strip().split('=', 1) for item in new_cookie.split(';') if '=' in item)}
-                response = session.post('https://chat.akash.network/api/chat', json=akash_data, cookies=new_cookies_dict, stream=True)
-        
-        if response.status_code not in [200, 201]:
-            logger.error(f"Akash API error: Status {response.status_code}, Response: {response.text}")
-            raise HTTPException(status_code=response.status_code, detail=f"Akash API error: {response.text}")
-        
-        def generate():
-            # =================== 最终完美版逻辑 START ===================
-            last_content = ""
-            # 状态标志：False=累积流模式, True=片段流模式(在think块后触发)
-            is_fragment_mode = False
+        with requests.Session() as session:
+            session.headers.update(fingerprint["headers"])
+            cookies_dict = {name: value for name, value in (item.strip().split('=', 1) for item in cookie.split(';') if '=' in item)}
+            
+            response = session.post('https://chat.akash.network/api/chat', json=akash_data, cookies=cookies_dict, stream=True)
+            
+            if response.status_code in [401, 403]:
+                logger.info(f"Authentication failed with status {response.status_code}, refreshing cookie...")
+                new_cookie = await refresh_cookie()
+                if new_cookie:
+                    logger.info("Successfully refreshed cookie, retrying request")
+                    new_cookies_dict = {name: value for name, value in (item.strip().split('=', 1) for item in new_cookie.split(';') if '=' in item)}
+                    response = session.post('https://chat.akash.network/api/chat', json=akash_data, cookies=new_cookies_dict, stream=True)
+            
+            if response.status_code not in [200, 201]:
+                logger.error(f"Akash API error: Status {response.status_code}, Response: {response.text}")
+                raise HTTPException(status_code=response.status_code, detail=f"Akash API error: {response.text}")
+            
+            def generate():
+                # =================== 最终完美版逻辑 START ===================
+                last_content = ""
+                # 状态标志：False=累积流模式, True=片段流模式(在think块后触发)
+                is_fragment_mode = False
 
-            for line in response.iter_lines():
-                if not line:
-                    continue
-                try:
-                    line_str = line.decode('utf-8')
-                    if ':' not in line_str:
+                for line in response.iter_lines():
+                    if not line:
                         continue
+                    try:
+                        line_str = line.decode('utf-8')
+                        if ':' not in line_str:
+                            continue
+                            
+                        msg_type, msg_data = line_str.split(':', 1)
                         
-                    msg_type, msg_data = line_str.split(':', 1)
-                    
-                    if msg_type == '0':
-                        try:
-                            content = json.loads(msg_data)
-                        except json.JSONDecodeError:
-                            content = msg_data[1:-1] if msg_data.startswith('"') and msg_data.endswith('"') else msg_data
-                        
-                        content = content.replace("\\n", "\n")
-                        
-                        delta_to_send = ""
+                        if msg_type == '0':
+                            try:
+                                content = json.loads(msg_data)
+                            except json.JSONDecodeError:
+                                content = msg_data[1:-1] if msg_data.startswith('"') and msg_data.endswith('"') else msg_data
+                            
+                            content = content.replace("\\n", "\n")
+                            
+                            delta_to_send = ""
 
-                        # 检查是否是特殊的<think>块，这是模式切换的信号
-                        if "<think>" in content and "</think>" in content and not is_fragment_mode:
-                            delta_to_send = content
-                            is_fragment_mode = True # 切换到片段流模式
-                        elif is_fragment_mode:
-                            # 进入片段模式后，所有内容都直接是delta
-                            delta_to_send = content
-                        else:
-                            # 默认处理累积流模式
-                            if len(content) > len(last_content) and content.startswith(last_content):
-                                delta_to_send = content[len(last_content):]
-                                last_content = content
-                            # 处理流重置的情况，例如从一个累积块跳到另一个
-                            elif not content.startswith(last_content) or len(content) < len(last_content):
+                            # 检查是否是特殊的<think>块，这是模式切换的信号
+                            if "<think>" in content and "</think>" in content and not is_fragment_mode:
                                 delta_to_send = content
-                                last_content = content
-                            # 如果内容完全相同，则忽略
+                                is_fragment_mode = True # 切换到片段流模式
+                            elif is_fragment_mode:
+                                # 进入片段模式后，所有内容都直接是delta
+                                delta_to_send = content
                             else:
-                                delta_to_send = ""
+                                # 默认处理累积流模式
+                                if len(content) > len(last_content) and content.startswith(last_content):
+                                    delta_to_send = content[len(last_content):]
+                                    last_content = content
+                                # 处理流重置的情况，例如从一个累积块跳到另一个
+                                elif not content.startswith(last_content) or len(content) < len(last_content):
+                                    delta_to_send = content
+                                    last_content = content
+                                # 如果内容完全相同，则忽略
+                                else:
+                                    delta_to_send = ""
 
-                        if delta_to_send:
+                            if delta_to_send:
+                                chunk = {
+                                    "id": f"chatcmpl-{chat_id}", "object": "chat.completion.chunk",
+                                    "created": int(time.time()), "model": data.get('model'),
+                                    "choices": [{"delta": {"content": delta_to_send}, "index": 0, "finish_reason": None}]
+                                }
+                                yield f"data: {json.dumps(chunk)}\n\n"
+                        
+                        elif msg_type in ['e', 'd']:
                             chunk = {
                                 "id": f"chatcmpl-{chat_id}", "object": "chat.completion.chunk",
                                 "created": int(time.time()), "model": data.get('model'),
-                                "choices": [{"delta": {"content": delta_to_send}, "index": 0, "finish_reason": None}]
+                                "choices": [{"delta": {}, "index": 0, "finish_reason": "stop"}]
                             }
                             yield f"data: {json.dumps(chunk)}\n\n"
-                    
-                    elif msg_type in ['e', 'd']:
-                        chunk = {
-                            "id": f"chatcmpl-{chat_id}", "object": "chat.completion.chunk",
-                            "created": int(time.time()), "model": data.get('model'),
-                            "choices": [{"delta": {}, "index": 0, "finish_reason": "stop"}]
-                        }
-                        yield f"data: {json.dumps(chunk)}\n\n"
-                        yield "data: [DONE]\n\n"
-                        break
-                except Exception as e:
-                    logger.error(f"Stream processing error: {e} on line: {line_str}", exc_info=True)
-                    continue
-            # =================== 最终完美版逻辑 END ===================
+                            yield "data: [DONE]\n\n"
+                            break
+                    except Exception as e:
+                        logger.error(f"Stream processing error: {e} on line: {line_str}", exc_info=True)
+                        continue
+                # =================== 最终完美版逻辑 END ===================
 
-        return StreamingResponse(generate(), media_type='text/event-stream', headers={'Cache-Control': 'no-cache', 'Connection': 'keep-alive'})
+            return StreamingResponse(generate(), media_type='text/event-stream', headers={'Cache-Control': 'no-cache', 'Connection': 'keep-alive'})
     
     except Exception as e:
         logger.error(f"Error in chat_completions: {e}", exc_info=True)
