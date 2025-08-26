@@ -1099,7 +1099,7 @@ async def chat_completions(
                 )
             
             def generate():
-                # FINAL FIX: Track the length of the content already sent.
+                # 最终修复：追踪已发送内容的长度，以处理上游的累积式数据流
                 last_len = 0
 
                 for line in response.iter_lines():
@@ -1111,11 +1111,11 @@ async def chat_completions(
                         msg_type, msg_data = line_str.split(':', 1)
                         
                         if msg_type == '0':
-                            # It's safer to use json.loads for robust parsing of the string content
+                            # 优先使用json.loads来安全地解析字符串内容
                             try:
                                 current_content = json.loads(msg_data)
                             except json.JSONDecodeError:
-                                # Fallback for cases where the data is not a valid JSON string
+                                # 如果不是标准的JSON字符串，则进行手动处理作为后备
                                 if msg_data.startswith('"') and msg_data.endswith('"'):
                                     current_content = msg_data[1:-1]
                                 else:
@@ -1144,8 +1144,8 @@ async def chat_completions(
                                         yield f"data: {json.dumps(message)}\n\n"
                                     continue
                             
-                            # FINAL FIX: Calculate the delta by slicing the string from the last known length.
-                            # This is the most robust way to handle the cumulative stream.
+                            # 最终修复逻辑：通过切片计算增量内容
+                            # 这是处理累积式数据流最稳健的方法
                             new_delta = current_content[last_len:]
                             last_len = len(current_content)
                             
@@ -1156,7 +1156,7 @@ async def chat_completions(
                                     "created": int(time.time()),
                                     "model": data.get('model'),
                                     "choices": [{
-                                        "delta": {"content": new_delta},
+                                        "delta": {"content": new_delta}, # <-- 关键：只发送计算出的增量内容
                                         "index": 0,
                                         "finish_reason": None
                                     }]
