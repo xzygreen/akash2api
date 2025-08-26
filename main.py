@@ -21,14 +21,17 @@ from playwright.sync_api import sync_playwright
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor
 import random
+
 # 加载环境变量
 load_dotenv(override=True)
+
 # 配置日志
 logging.basicConfig(
     level=logging.INFO,  # 改为 INFO 级别
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
 # 修改全局数据存储
 global_data = {
     "cookie": None,
@@ -37,6 +40,33 @@ global_data = {
     "cookie_expires": 0,  # 添加 cookie 过期时间
     "is_refreshing": False  # 添加刷新状态标志
 }
+
+# ==== FIX 1: 累计->增量 工具函数 & 可选隐藏思考 ====
+
+def _lcp_delta(prev: str, curr: str) -> str:
+    """
+    计算 curr 相比 prev 的新增部分：
+    - 如果 curr 以 prev 为前缀，返回简单后缀。
+    - 否则做一次最长公共前缀（LCP）计算，兼容上游对已生成内容的微调/回写。
+    """
+    if curr.startswith(prev):
+        return curr[len(prev):]
+    i = 0
+    m = min(len(prev), len(curr))
+    while i < m and prev[i] == curr[i]:
+        i += 1
+    return curr[i:]
+
+
+def _strip_think(text: str) -> str:
+    """
+    可选：去掉 <think>...</think> 片段，避免把“思考过程”展示给用户。
+    如需保留思考，请在 generate() 中注释掉该调用。
+    """
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.S)
+
+# =======================================================
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 启动时获取 cookie
@@ -61,6 +91,8 @@ async def lifespan(app: FastAPI):
     global_data["cookies"] = None
     global_data["last_update"] = 0
     global_data["is_refreshing"] = False
+
+
 def get_cookie_with_retry(max_retries=3, retry_delay=5):
     """带重试机制的获取 cookie 函数"""
     retries = 0
@@ -78,12 +110,17 @@ def get_cookie_with_retry(max_retries=3, retry_delay=5):
     
     logger.error(f"Failed to fetch cookie after {max_retries} attempts")
     return None
+
+
 app = FastAPI(lifespan=lifespan)
 security = HTTPBearer()
+
 # OpenAI API Key 配置，可以通过环境变量覆盖
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", None)
 logger.info(f"OPENAI_API_KEY is set: {OPENAI_API_KEY is not None}")
 # logger.info(f"OPENAI_API_KEY value: {OPENAI_API_KEY}")
+
+
 def get_random_browser_fingerprint():
     """生成随机的浏览器指纹"""
     # 随机选择浏览器版本
@@ -144,6 +181,8 @@ def get_random_browser_fingerprint():
         "viewport": selected_viewport,
         "user_agent": user_agent
     }
+
+
 def get_cookie():
     """获取 cookie 的函数"""
     browser = None
@@ -389,6 +428,8 @@ def get_cookie():
     gc.collect()
     
     return None
+
+
 # 添加刷新 cookie 的函数
 async def refresh_cookie():
     """刷新 cookie 的函数，用于401错误触发"""
@@ -419,6 +460,8 @@ async def refresh_cookie():
         return new_cookie
     finally:
         global_data["is_refreshing"] = False
+
+
 async def background_refresh_cookie():
     """后台刷新 cookie 的函数，不影响接口调用"""
     if global_data["is_refreshing"]:
@@ -454,6 +497,8 @@ async def background_refresh_cookie():
         logger.error(f"Error in background cookie refresh: {e}")
     finally:
         global_data["is_refreshing"] = False
+
+
 async def check_and_update_cookie():
     """检查并更新 cookie"""
     try:
@@ -482,6 +527,8 @@ async def check_and_update_cookie():
         logger.error(f"Error in check_and_update_cookie: {e}")
         import traceback
         logger.error(f"Traceback: {traceback.format_exc()}")
+
+
 async def get_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
     token = credentials.credentials
     # logger.info(f"Received token: {token}")
@@ -500,6 +547,8 @@ async def get_api_key(credentials: HTTPAuthorizationCredentials = Depends(securi
         logger.info("API key validation passed")
     
     return True
+
+
 async def validate_cookie(background_tasks: BackgroundTasks):
     # 检查并更新 cookie（如果需要）
     await check_and_update_cookie()
@@ -521,8 +570,11 @@ async def validate_cookie(background_tasks: BackgroundTasks):
     
     logger.info("Cookie validation passed")
     return global_data["cookie"]
+
+
+# ==== FIX 2: 健壮的图片状态检查（支持 base64 / dataURL / 相对 & 绝对 URL） ====
 async def check_image_status(session: requests.Session, full_job_id: str, short_job_id: str, headers: dict) -> Optional[str]:
-    """检查图片生成状态并获取生成的图片"""
+    """检查图片生成状态并获取生成的图片URL（必要时转存图床以去除鉴权）"""
     max_retries = 30
     for attempt in range(max_retries):
         try:
@@ -541,11 +593,9 @@ async def check_image_status(session: requests.Session, full_job_id: str, short_
                     check_image_status._consecutive_404s += 1
                 else:
                     check_image_status._consecutive_404s = 1
-                
                 if check_image_status._consecutive_404s >= 3:
                     print(f"Stopping after {check_image_status._consecutive_404s} consecutive 404s")
                     return None
-                
                 await asyncio.sleep(1)
                 continue
             else:
@@ -565,57 +615,71 @@ async def check_image_status(session: requests.Session, full_job_id: str, short_
                     print(f"API returned result: {result}")
                     print(f"Full job_info: {job_info}")
                     
-                    if result and not result.startswith("Failed"):
-                        print("Got valid result...")
-                        
-                        # 如果result是相对路径，下载并上传到图床（因为直接访问需要认证）
-                        if result.startswith("/api/image/"):
-                            image_url = f"https://chat.akash.network{result}"
-                            print(f"Downloading image from: {image_url}")
-                            
+                    if not result or (isinstance(result, str) and result.startswith("Failed")):
+                        print("Invalid result received")
+                        return None
+
+                    # 1) dataURL base64: data:image/webp;base64,xxxxx
+                    if isinstance(result, str):
+                        m = re.match(r"^data:image/[a-zA-Z0-9.+-]+;base64,(.+)$", result)
+                        if m:
                             try:
-                                # 使用当前session和headers下载图片（包含认证信息）
-                                image_response = session.get(image_url, headers=headers)
-                                print(f"Download response status: {image_response.status_code}")
-                                
-                                if image_response.status_code == 200:
-                                    print("Successfully downloaded image, uploading to image host...")
-                                    print(f"Image content length: {len(image_response.content)} bytes")
-                                    
-                                    # 上传到新野图床
-                                    upload_url = await upload_to_xinyew(image_response.content, full_job_id)
-                                    if upload_url:
-                                        print(f"Successfully uploaded image: {upload_url}")
-                                        return upload_url
-                                    print("Image upload failed")
-                                    return None
-                                else:
-                                    print(f"Failed to download image, status: {image_response.status_code}")
-                                    print(f"Response content: {image_response.text[:200]}...")
-                                    return None
+                                img_bytes = base64.b64decode(m.group(1), validate=True)
+                                upload_url = await upload_to_xinyew(img_bytes, full_job_id)
+                                if upload_url:
+                                    return upload_url
                             except Exception as e:
-                                print(f"Error downloading image: {e}")
-                                import traceback
-                                print(traceback.format_exc())
+                                print(f"Error decoding dataURL base64: {e}")
                                 return None
-                        # 如果result不是完整路径，可能需要构建图片URL
-                        elif result and not result.startswith("http"):
-                            # 从result构建图片URL，格式: /api/image/job_{short_id}_00001_.webp
-                            if not result.startswith("/"):
-                                image_url = f"https://chat.akash.network/api/image/job_{short_job_id}_00001_.webp"
-                                print(f"Constructed Akash image URL: {image_url}")
-                                return image_url
-                        else:
-                            # 如果result是base64数据，上传到图床
-                            print("Got base64 result, uploading to image host...")
-                            upload_url = await upload_to_mjj(result, job_id)
-                            if upload_url:
-                                print(f"Successfully uploaded image: {upload_url}")
-                                return upload_url
-                            print("Image upload failed")
+
+                    # 2) 纯 base64（无 dataURL 头）
+                    if isinstance(result, str):
+                        try:
+                            img_bytes = base64.b64decode(result, validate=True)
+                            # 解码成功且大小合理才认为是图片
+                            if img_bytes and len(img_bytes) > 100:
+                                upload_url = await upload_to_xinyew(img_bytes, full_job_id)
+                                if upload_url:
+                                    return upload_url
+                        except Exception:
+                            pass  # 不是纯 base64，继续判断
+
+                    # 3) 绝对 http(s) 链接：最好下载后转存，避免需要认证
+                    if isinstance(result, str) and result.startswith("http"):
+                        try:
+                            image_response = session.get(result, headers=headers)
+                            if image_response.status_code == 200:
+                                upload_url = await upload_to_xinyew(image_response.content, full_job_id)
+                                if upload_url:
+                                    return upload_url
+                            # 回退：直接返回原链接
+                            return result
+                        except Exception as e:
+                            print(f"Error fetching absolute image url: {e}")
+                            return result
+
+                    # 4) 相对地址（如 /api/image/...）
+                    if isinstance(result, str) and result.startswith("/"):
+                        image_url = f"https://chat.akash.network{result}"
+                        print(f"Downloading relative image URL: {image_url}")
+                        try:
+                            image_response = session.get(image_url, headers=headers)
+                            if image_response.status_code == 200:
+                                upload_url = await upload_to_xinyew(image_response.content, full_job_id)
+                                if upload_url:
+                                    print(f"Successfully uploaded image: {upload_url}")
+                                    return upload_url
+                            print(f"Failed to download relative image, status: {image_response.status_code}")
                             return None
-                    print("Invalid result received")
-                    return None
+                        except Exception as e:
+                            print(f"Error downloading relative image: {e}")
+                            return None
+
+                    # 5) 其他情况：尝试根据 short_job_id 构造默认URL（兼容某些返回格式）
+                    constructed = f"https://chat.akash.network/api/image/job_{short_job_id}_00001_.webp"
+                    print(f"Constructed Akash image URL: {constructed}")
+                    return constructed
+
                 elif status == "failed":
                     print(f"Job {full_job_id} failed")
                     return None
@@ -630,6 +694,9 @@ async def check_image_status(session: requests.Session, full_job_id: str, short_
     
     print(f"Timeout waiting for job {full_job_id}")
     return None
+# =======================================================
+
+
 @app.get("/", response_class=HTMLResponse)
 async def health_check():
     """健康检查端点，返回服务状态"""
@@ -923,7 +990,7 @@ async def health_check():
                 font-family: monospace;
             }}
             .contact-info {{
-                display: flex;
+                display: flex,
                 align-items: center;
                 justify-content: center;
                 gap: 15px;
@@ -1006,6 +1073,8 @@ async def health_check():
     </body>
     </html>
     """)
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(
     request: Request,
@@ -1051,7 +1120,9 @@ async def chat_completions(
         cookie_end = cookie[-20:] if len(cookie) > 40 else ""
         logger.info(f"Using cookie: {cookie_start}...{cookie_end}")
         
-        with requests.Session() as session:
+        # ==== FIX 3: 用显式 session 并在生成器结束时关闭，避免提前退出 with 导致断流 ====
+        session = requests.Session()
+        try:
             # 设置 Cookie 使用请求头方式
             session.headers.update(fingerprint["headers"])
             cookies_dict = {}
@@ -1062,7 +1133,6 @@ async def chat_completions(
                     name, value = cookie_item.strip().split('=', 1)
                     cookies_dict[name] = value
             
-            # 使用 cookies 参数而不是 headers['Cookie']
             response = session.post(
                 'https://chat.akash.network/api/chat',
                 json=akash_data,
@@ -1092,83 +1162,133 @@ async def chat_completions(
             
             if response.status_code not in [200, 201]:
                 logger.error(f"Akash API error: Status {response.status_code}, Response: {response.text}")
+                # 关闭资源
+                try:
+                    response.close()
+                except:
+                    pass
+                session.close()
                 raise HTTPException(
                     status_code=response.status_code,
                     detail=f"Akash API error: {response.text}"
                 )
-            
+
+            # ==== FIX 4: 仅推“增量文本” + 首帧 role + 避免重复触发图生 ====
             def generate():
-                for line in response.iter_lines():
-                    if not line:
-                        continue
-                        
-                    try:
-                        line_str = line.decode('utf-8')
-                        try:
-                            msg_type, msg_data = line_str.split(':', 1)
-                        except ValueError:
-                            logger.warning(f"Skipping malformed line: {line_str}")
+                last_text = ""     # 上游累计文本的上一帧
+                sent_role = False  # 首帧补 role
+                image_job_done = False  # 避免 <image_generation> 反复触发
+
+                try:
+                    for line in response.iter_lines(decode_unicode=True):
+                        if not line:
                             continue
-                        
-                        if msg_type == '0':
-                            if msg_data.startswith('"') and msg_data.endswith('"'):
-                                msg_data = msg_data.replace('\\"', '"')
-                                msg_data = msg_data[1:-1]
-                            msg_data = msg_data.replace("\\n", "\n")
-                            
-                            # 在处理消息时先判断模型类型
-                            if data.get('model') == 'AkashGen' and "<image_generation>" in msg_data:
-                                # 图片生成模型的特殊处理
-                                async def process_and_send():
-                                    messages = await process_image_generation(msg_data, session, fingerprint["headers"], chat_id)
-                                    if messages:
-                                        return messages
-                                    return None
-                                # 创建新的事件循环
-                                loop = asyncio.new_event_loop()
-                                asyncio.set_event_loop(loop)
-                                try:
-                                    result_messages = loop.run_until_complete(process_and_send())
-                                finally:
-                                    loop.close()
-                                
-                                if result_messages:
-                                    for message in result_messages:
-                                        yield f"data: {json.dumps(message)}\n\n"
+                        try:
+                            line_str = line if isinstance(line, str) else line.decode('utf-8', 'ignore')
+                            if ':' not in line_str:
+                                # 非法或心跳帧，忽略
+                                continue
+                            msg_type, msg_data = line_str.split(':', 1)
+
+                            if msg_type == '0':
+                                # 上游把字符串做了 JSON 字符串转义，做一次反转义
+                                if msg_data.startswith('"') and msg_data.endswith('"'):
+                                    msg_data = msg_data[1:-1].replace('\\"', '"')
+                                msg_data = msg_data.replace("\\n", "\n")
+
+                                # 图片生成：只触发一次，防止在累计文本中多次出现而重复执行
+                                if data.get('model') == 'AkashGen' and "<image_generation>" in msg_data and not image_job_done:
+                                    async def process_and_send():
+                                        messages = await process_image_generation(msg_data, session, fingerprint["headers"], chat_id)
+                                        if messages:
+                                            return messages
+                                        return None
+                                    loop = asyncio.new_event_loop()
+                                    asyncio.set_event_loop(loop)
+                                    try:
+                                        result_messages = loop.run_until_complete(process_and_send())
+                                    finally:
+                                        loop.close()
+
+                                    image_job_done = True
+                                    if result_messages:
+                                        for message in result_messages:
+                                            yield f"data: {json.dumps(message, ensure_ascii=False)}\n\n"
+                                    # 本次 0: 事件不再继续输出文本
                                     continue
-                            
-                            chunk = {
-                                "id": f"chatcmpl-{chat_id}",
-                                "object": "chat.completion.chunk",
-                                "created": int(time.time()),
-                                "model": data.get('model'),
-                                "choices": [{
-                                    "delta": {"content": msg_data},
-                                    "index": 0,
-                                    "finish_reason": None
-                                }]
-                            }
-                            yield f"data: {json.dumps(chunk)}\n\n"
-                        
-                        elif msg_type in ['e', 'd']:
-                            chunk = {
-                                "id": f"chatcmpl-{chat_id}",
-                                "object": "chat.completion.chunk",
-                                "created": int(time.time()),
-                                "model": data.get('model'),
-                                "choices": [{
-                                    "delta": {},
-                                    "index": 0,
-                                    "finish_reason": "stop"
-                                }]
-                            }
-                            yield f"data: {json.dumps(chunk)}\n\n"
-                            yield "data: [DONE]\n\n"
-                            break
-                            
-                    except Exception as e:
-                        print(f"Error processing line: {e}")
-                        continue
+
+                                # 把“累计”转为“增量”
+                                new_text = _lcp_delta(last_text, msg_data)
+                                last_text = msg_data  # 更新累计文本
+
+                                if not new_text:
+                                    continue  # 跳过空增量
+
+                                # 可选：隐藏思考（如需保留，可注释这一行）
+                                new_text = _strip_think(new_text)
+                                if not new_text:
+                                    continue
+
+                                # 首帧补 role
+                                if not sent_role:
+                                    role_chunk = {
+                                        "id": f"chatcmpl-{chat_id}",
+                                        "object": "chat.completion.chunk",
+                                        "created": int(time.time()),
+                                        "model": data.get('model'),
+                                        "choices": [{
+                                            "delta": {"role": "assistant"},
+                                            "index": 0,
+                                            "finish_reason": None
+                                        }]
+                                    }
+                                    yield f"data: {json.dumps(role_chunk, ensure_ascii=False)}\n\n"
+                                    sent_role = True
+
+                                chunk = {
+                                    "id": f"chatcmpl-{chat_id}",
+                                    "object": "chat.completion.chunk",
+                                    "created": int(time.time()),
+                                    "model": data.get('model'),
+                                    "choices": [{
+                                        "delta": {"content": new_text},
+                                        "index": 0,
+                                        "finish_reason": None
+                                    }]
+                                }
+                                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+                            elif msg_type in ['e', 'd']:
+                                # 结束帧
+                                chunk = {
+                                    "id": f"chatcmpl-{chat_id}",
+                                    "object": "chat.completion.chunk",
+                                    "created": int(time.time()),
+                                    "model": data.get('model'),
+                                    "choices": [{
+                                        "delta": {},
+                                        "index": 0,
+                                        "finish_reason": "stop"
+                                    }]
+                                }
+                                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                                yield "data: [DONE]\n\n"
+                                break
+
+                        except Exception as e:
+                            print(f"Error processing line: {e}")
+                            continue
+                finally:
+                    # 结束时关闭底层响应与会话
+                    try:
+                        response.close()
+                    except Exception:
+                        pass
+                    try:
+                        session.close()
+                    except Exception:
+                        pass
+
             return StreamingResponse(
                 generate(),
                 media_type='text/event-stream',
@@ -1178,12 +1298,23 @@ async def chat_completions(
                     'Content-Type': 'text/event-stream'
                 }
             )
+        except Exception:
+            # 双保险：异常时关闭 session
+            try:
+                session.close()
+            except Exception:
+                pass
+            raise
     
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"Error in chat_completions: {e}")
         import traceback
         print(traceback.format_exc())
         return {"error": str(e)}
+
+
 @app.get("/v1/models")
 async def list_models(
     background_tasks: BackgroundTasks,
@@ -1297,6 +1428,8 @@ async def list_models(
         import traceback
         logger.error(f"Traceback: {traceback.format_exc()}")
         return {"error": str(e)}
+
+
 async def process_image_generation(msg_data: str, session: requests.Session, headers: dict, chat_id: str) -> Optional[list]:
     """处理图片生成的逻辑，返回多个消息块"""
     # 检查消息中是否包含jobId
@@ -1394,6 +1527,8 @@ async def process_image_generation(msg_data: str, session: requests.Session, hea
         import traceback
         logger.error(f"Traceback: {traceback.format_exc()}")
         return create_error_messages(chat_id, "图片生成过程中发生错误。请稍后再试。")
+
+
 def create_error_messages(chat_id: str, error_message: str) -> list:
     """创建错误消息块"""
     return [{
@@ -1407,6 +1542,7 @@ def create_error_messages(chat_id: str, error_message: str) -> list:
             "finish_reason": None
         }]
     }]
+
 
 async def upload_to_xinyew(image_data: bytes, job_id: str) -> Optional[str]:
     """上传图片到新野图床并返回URL"""
@@ -1484,6 +1620,7 @@ async def upload_to_xinyew(image_data: bytes, job_id: str) -> Optional[str]:
         print(traceback.format_exc())
         return None
 
+
 def auto_refresh_cookie():
     """自动刷新 cookie 的线程函数"""
     while True:
@@ -1522,6 +1659,8 @@ def auto_refresh_cookie():
             import gc
             gc.collect()
             time.sleep(60)  # 出错后等待60秒再继续
+
+
 if __name__ == '__main__':
     import uvicorn
     uvicorn.run(app, host='0.0.0.0', port=9000)
