@@ -1006,6 +1006,7 @@ async def health_check():
     </body>
     </html>
     """)
+
 @app.post("/v1/chat/completions")
 async def chat_completions(
     request: Request,
@@ -1098,7 +1099,9 @@ async def chat_completions(
                 )
             
             def generate():
-                # content_buffer = "" # <-- REMOVED: This buffer caused the cumulative output issue.
+                # This variable will track the content sent in the previous chunk.
+                previously_sent_content = ""
+
                 for line in response.iter_lines():
                     if not line:
                         continue
@@ -1122,8 +1125,6 @@ async def chat_completions(
                                         return messages
                                     return None
                                 # 创建新的事件循环
-                                # Note: Creating a new event loop here is not ideal in an async framework.
-                                # A more robust solution might involve refactoring, but this works for now.
                                 loop = asyncio.new_event_loop()
                                 asyncio.set_event_loop(loop)
                                 try:
@@ -1136,20 +1137,32 @@ async def chat_completions(
                                         yield f"data: {json.dumps(message)}\n\n"
                                     continue
                             
-                            # content_buffer += msg_data # <-- REMOVED: This was the cause of the problem.
+                            # Manually calculate the delta because the upstream API sends cumulative content
+                            new_delta = ""
+                            if msg_data.startswith(previously_sent_content):
+                                # If the new data contains the old data at the start, slice it to get the new part
+                                new_delta = msg_data[len(previously_sent_content):]
+                            else:
+                                # Otherwise, something is unusual, just send the new data as is
+                                new_delta = msg_data
                             
-                            chunk = {
-                                "id": f"chatcmpl-{chat_id}",
-                                "object": "chat.completion.chunk",
-                                "created": int(time.time()),
-                                "model": data.get('model'),
-                                "choices": [{
-                                    "delta": {"content": msg_data}, # Now correctly sends only the new part.
-                                    "index": 0,
-                                    "finish_reason": None
-                                }]
-                            }
-                            yield f"data: {json.dumps(chunk)}\n\n"
+                            # Update the tracker for the next iteration
+                            previously_sent_content = msg_data
+                            
+                            # Only send a chunk if there is new content
+                            if new_delta:
+                                chunk = {
+                                    "id": f"chatcmpl-{chat_id}",
+                                    "object": "chat.completion.chunk",
+                                    "created": int(time.time()),
+                                    "model": data.get('model'),
+                                    "choices": [{
+                                        "delta": {"content": new_delta}, # <-- Send the calculated new_delta
+                                        "index": 0,
+                                        "finish_reason": None
+                                    }]
+                                }
+                                yield f"data: {json.dumps(chunk)}\n\n"
                         
                         elif msg_type in ['e', 'd']:
                             chunk = {
@@ -1185,6 +1198,7 @@ async def chat_completions(
         import traceback
         print(traceback.format_exc())
         return {"error": str(e)}
+
 @app.get("/v1/models")
 async def list_models(
     background_tasks: BackgroundTasks,
